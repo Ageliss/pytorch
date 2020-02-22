@@ -1,74 +1,71 @@
 #pragma once
 
-#include "ATen/core/Tensor.h"
-#include "ATen/core/Scalar.h"
-#include "ATen/core/SparseTensorRef.h"
-#include "ATen/core/Type.h"
-#include "ATen/core/TensorOptions.h"
+#include <c10/core/Scalar.h>
+#include <c10/core/MemoryFormat.h>
+#include <c10/core/QScheme.h>
+#include <c10/macros/Macros.h>
+#include <c10/core/TensorOptions.h>
+#include <c10/util/intrusive_ptr.h>
+#include <ATen/core/DeprecatedTypeProperties.h>
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <ATen/core/NamedTensor.h>
+#include <ATen/core/LegacyTypeDispatch.h>
+
+#ifdef USE_STATIC_DISPATCH
+#include <ATen/TypeDefault.h>
+#include <ATen/CPUType.h>
+#include <ATen/QuantizedCPUType.h>
+#endif
 
 namespace at {
 
-inline Tensor Tensor::toType(const Type & t, bool non_blocking) const {
-  if(type() == t)
-    return *this;
-  return t.copy(*this, non_blocking);
-}
+struct Quantizer;
+// This is temporary typedef to enable Quantizer in aten native function API
+// we'll remove them when we are actually exposing Quantizer class
+// to frontend
+using ConstQuantizerPtr = const c10::intrusive_ptr<Quantizer>&;
 
 inline Tensor Tensor::cpu() const {
-  return toType(type().cpu());
+  return to(options().device(DeviceType::CPU), /*non_blocking*/ false, /*copy*/ false);
 }
 
+// TODO: The Python version also accepts arguments
 inline Tensor Tensor::cuda() const {
-  return toType(type().cuda());
+  return to(options().device(DeviceType::CUDA), /*non_blocking*/ false, /*copy*/ false);
 }
 
-inline Tensor & Tensor::copy_(const Tensor & src, bool non_blocking) {
-  return type().copy_(*this, src, non_blocking);
+inline Tensor Tensor::hip() const {
+  return to(options().device(DeviceType::HIP), /*non_blocking*/ false, /*copy*/ false);
 }
 
 inline Tensor Tensor::toType(ScalarType t) const {
-  return toType(type().toScalarType(t));
+  return to(options().dtype(t), /*non_blocking*/ false, /*copy*/ false);
 }
 
+// TODO: Deprecate me
 inline Tensor Tensor::toBackend(Backend b) const {
-  return toType(type().toBackend(b));
+  return to(options().device(backendToDeviceType(b)).layout(layout_from_backend(b)), /*non_blocking*/ false, /*copy*/ false);
 }
 
 inline TensorOptions Tensor::options() const {
   return TensorOptions().dtype(dtype())
                         .device(device())
-                        .layout(layout())
-                        .is_variable(is_variable());
-}
-
-inline void Tensor::backward(
-    c10::optional<Tensor> gradient,
-    bool keep_graph,
-    bool create_graph) {
-  type().backward(*this, std::move(gradient), keep_graph, create_graph);
-}
-
-inline void Tensor::set_data(Tensor new_data) {
-  type().set_data(*this, new_data);
+                        .layout(layout());
 }
 
 // all static inline to allow for inlining of the non-dynamic part of dispatch
 ${tensor_method_definitions}
-
-inline bool Tensor::is_variable() const noexcept {
-  return type().is_variable();
-}
 
 inline caffe2::TypeMeta Tensor::dtype() const noexcept {
   return impl_->dtype();
 }
 
 inline Layout Tensor::layout() const noexcept {
-  return type().layout();
+  return impl_->layout();
 }
 
 inline Device Tensor::device() const {
-  return Device(type().device_type(), type().is_cuda() ? get_device() : -1);
+  return impl_->device();
 }
 
 inline int64_t Tensor::get_device() const {
@@ -85,8 +82,34 @@ inline bool Tensor::is_cuda() const {
   return impl_->is_cuda();
 }
 
+inline NamedTensorMeta* Tensor::get_named_tensor_meta() {
+  return static_cast<NamedTensorMeta*>(impl_->named_tensor_meta());
+}
+
+inline const NamedTensorMeta* Tensor::get_named_tensor_meta() const {
+  return static_cast<NamedTensorMeta*>(impl_->named_tensor_meta());
+}
+
+inline bool Tensor::has_names() const {
+  // If a user is using unnamed tensors, then we can short-circuit right here.
+  // Otherwise, impl::has_names attempts to retrieve names.
+  if (!impl_->has_named_tensor_meta()) {
+    return false;
+  }
+  return impl::has_names(unsafeGetTensorImpl());
+}
+
 inline bool is_cuda(Tensor self) {
   return self.is_cuda();
+}
+
+inline bool Tensor::is_hip() const {
+  // NB: this is not a native function to avoid dispatching overhead.
+  return impl_->is_hip();
+}
+
+inline bool is_hip(Tensor self) {
+  return self.is_hip();
 }
 
 inline bool Tensor::is_sparse() const {
@@ -98,28 +121,67 @@ inline bool is_sparse(Tensor self) {
   return self.is_sparse();
 }
 
-#define DEFINE_CAST(T, name, _)                  \
+inline bool Tensor::is_mkldnn() const {
+  // NB: this is not a native function to avoid dispatching overhead.
+  return impl_->is_mkldnn();
+}
+
+inline bool is_mkldnn(Tensor self) {
+  return self.is_mkldnn();
+}
+
+inline bool Tensor::is_quantized() const {
+  // NB: this is not a native function to avoid dispatching overhead.
+  return impl_->is_quantized();
+}
+
+inline bool is_quantized(Tensor self) {
+  return self.is_quantized();
+}
+
+#define DEFINE_CAST(T, name)                     \
   template <>                                    \
-  inline T* Tensor::data() const {               \
-    AT_CHECK(                                    \
-        type().scalarType() == ScalarType::name, \
+  inline T* Tensor::data_ptr() const {           \
+    TORCH_CHECK(                                 \
+        scalar_type() == ScalarType::name,       \
         "expected scalar type ",                 \
         #name,                                   \
         " but found ",                           \
-        at::toString(type().scalarType()));      \
-    return static_cast<T*>(this->data_ptr());    \
+        c10::toString(scalar_type()));           \
+    return static_cast<T*>(this->unsafeGetTensorImpl()->data());    \
   }
 
 AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_EXCEPT_COMPLEX_HALF(DEFINE_CAST)
+AT_FORALL_QINT_TYPES(DEFINE_CAST)
 #undef DEFINE_CAST
 
-#define DEFINE_TO_C_TYPE(T, name, _)   \
-  template <>                          \
-  inline T Tensor::item() const {      \
-    return _local_scalar().to##name(); \
+#define DEFINE_ITEM(T, name)      \
+  template <>                     \
+  inline T Tensor::item() const { \
+    return item().to##name();     \
   }
 
-AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_EXCEPT_COMPLEX_HALF(DEFINE_TO_C_TYPE)
-#undef DEFINE_TO_C_TYPE
+AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_EXCEPT_COMPLEX_HALF(DEFINE_ITEM)
+#undef DEFINE_ITEM
+
+// Gradient Node and Edges
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+template <typename T>
+auto Tensor::register_hook(T&& hook) const -> Tensor::hook_return_void_t<T> {
+  // Return the grad argument in case of a hook with void return type to have an
+  // std::function with Tensor return type
+  std::function<void(Tensor)> fn(hook);
+  return _register_hook([fn](const Tensor& grad) {
+    fn(grad);
+    return Tensor();
+  });
+}
+
+template <typename T>
+auto Tensor::register_hook(T&& hook) const -> Tensor::hook_return_var_t<T> {
+  return _register_hook(hook);
+}
+
 
 } //namespace at

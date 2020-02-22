@@ -1,12 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <torch/nn/module.h>
-#include <torch/nn/modules/functional.h>
-#include <torch/nn/modules/linear.h>
-#include <torch/nn/modules/sequential.h>
-#include <torch/optim.h>
-#include <torch/tensor.h>
-#include <torch/utils.h>
+#include <torch/torch.h>
 
 #include <test/cpp/api/optim_baseline.h>
 #include <test/cpp/api/support.h>
@@ -70,7 +64,7 @@ void assign_parameter(
     const Parameters& parameters,
     const char* name,
     torch::Tensor new_tensor) {
-  auto parameter = parameters.at(name);
+  auto parameter = parameters[name];
   parameter.set_requires_grad(false);
   parameter.flatten().copy_(new_tensor);
   parameter.set_requires_grad(true);
@@ -94,20 +88,20 @@ void check_exact_values(
   model->to(torch::kFloat64);
 
   // Use exact input values because matching random values is hard.
-  auto parameters = model->parameters();
+  auto parameters = model->named_parameters();
   assign_parameter(
       parameters,
       "0.weight",
-      torch::tensor({-0.2109, -0.4976, -0.1413, -0.3420, -0.2524, 0.6976}));
+      torch::tensor({-0.2109, -0.4976, -0.1413, -0.3420, -0.2524, 0.6976}, torch::kFloat64));
   assign_parameter(
-      parameters, "0.bias", torch::tensor({-0.1085, -0.2979, 0.6892}));
+      parameters, "0.bias", torch::tensor({-0.1085, -0.2979, 0.6892}, torch::kFloat64));
   assign_parameter(
-      parameters, "2.weight", torch::tensor({-0.0508, -0.3941, -0.2843}));
-  assign_parameter(parameters, "2.bias", torch::tensor({-0.0711}));
+      parameters, "2.weight", torch::tensor({-0.0508, -0.3941, -0.2843}, torch::kFloat64));
+  assign_parameter(parameters, "2.bias", torch::tensor({-0.0711}, torch::kFloat64));
 
-  auto optimizer = OptimizerClass(parameters, options);
+  auto optimizer = OptimizerClass(parameters.values(), options);
   torch::Tensor input =
-      torch::tensor({0.1, 0.2, 0.3, 0.4, 0.5, 0.6}).reshape({3, 2});
+      torch::tensor({0.1, 0.2, 0.3, 0.4, 0.5, 0.6}, torch::kFloat64).reshape({3, 2});
 
   for (size_t i = 0; i < kIterations; ++i) {
     optimizer.zero_grad();
@@ -121,9 +115,10 @@ void check_exact_values(
       ASSERT_TRUE(
           expected_parameters.at(i / kSampleEvery).size() == parameters.size());
       for (size_t p = 0; p < parameters.size(); ++p) {
-        ASSERT_TRUE(parameters.at(p)->defined());
-        auto computed = parameters.at(p)->flatten();
-        auto expected = expected_parameters.at(i / kSampleEvery).at(p);
+        ASSERT_TRUE(parameters[p]->defined());
+        // Always compare using double dtype, regardless of the original dtype of the tensors
+        auto computed = parameters[p]->flatten().to(torch::kFloat64);
+        auto expected = expected_parameters.at(i / kSampleEvery).at(p).to(torch::kFloat64);
         if (!computed.allclose(expected, /*rtol=*/1e-3, /*atol=*/5e-4)) {
           std::cout << "Iteration " << i << ": " << computed
                     << " != " << expected << " (parameter " << p << ")"
@@ -133,6 +128,41 @@ void check_exact_values(
       }
     }
   }
+}
+
+TEST(OptimTest, OptimizerAccessors) {
+  auto options = AdagradOptions(1.0);
+  std::vector<torch::Tensor> params;
+  for (size_t i = 0; i < 3; i++) {
+    params.push_back(torch::randn(10));
+  }
+  auto optimizer = Adagrad(params, options);
+  // test for defaults() method with non-const reference
+  auto& options_ = static_cast<AdagradOptions&>(optimizer.defaults());
+  ASSERT_TRUE(options == options_);
+  // test for param_groups() with non-const reference return
+  auto& params_groups = optimizer.param_groups();
+  params_groups.push_back(OptimizerParamGroup(params));
+  auto& params_1 = params_groups[1].params();
+  for (size_t i = 0; i < params_1.size(); i++) {
+    torch::equal(params[i], params_1[i]);
+  }
+
+  // test for add_param_group() when one or more params existing in another param_group
+  // are passed in the new param group to be added
+  ASSERT_THROWS_WITH(
+    optimizer.add_param_group(OptimizerParamGroup(params)), "some parameters appear in more than one parameter group");
+
+  // test for state() with non-const reference return
+  auto& state_ = static_cast<AdagradParamState&>(*(optimizer.state()[c10::guts::to_string(params_1[0].unsafeGetTensorImpl())]));
+  state_.step(state_.step()+1);
+
+  const auto& optimizer_ = Adagrad(params, options);
+  optimizer_.defaults();
+  // test for param_groups() with const reference return
+  const auto& params_2 = optimizer_.param_groups();
+  // test for state() with const reference return
+  optimizer_.state();
 }
 
 TEST(OptimTest, BasicInterface) {
@@ -278,7 +308,7 @@ TEST(OptimTest, ZeroGrad) {
   SGD optimizer(model->parameters(), 0.1);
 
   for (const auto& parameter : model->parameters()) {
-    ASSERT_FALSE(parameter->grad().defined());
+    ASSERT_FALSE(parameter.grad().defined());
   }
 
   auto output = model->forward(torch::ones({5, 2}));
@@ -286,15 +316,15 @@ TEST(OptimTest, ZeroGrad) {
   loss.backward();
 
   for (const auto& parameter : model->parameters()) {
-    ASSERT_TRUE(parameter->grad().defined());
-    ASSERT_GT(parameter->grad().sum().item<float>(), 0);
+    ASSERT_TRUE(parameter.grad().defined());
+    ASSERT_GT(parameter.grad().sum().item<float>(), 0);
   }
 
   optimizer.zero_grad();
 
   for (const auto& parameter : model->parameters()) {
-    ASSERT_TRUE(parameter->grad().defined());
-    ASSERT_EQ(parameter->grad().sum().item<float>(), 0);
+    ASSERT_TRUE(parameter.grad().defined());
+    ASSERT_EQ(parameter.grad().sum().item<float>(), 0);
   }
 }
 

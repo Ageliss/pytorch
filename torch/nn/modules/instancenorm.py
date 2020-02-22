@@ -1,8 +1,8 @@
-from .batchnorm import _BatchNorm
+from .batchnorm import _NormBase
 from .. import functional as F
 
 
-class _InstanceNorm(_BatchNorm):
+class _InstanceNorm(_NormBase):
     def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=False,
                  track_running_stats=False):
         super(_InstanceNorm, self).__init__(
@@ -11,9 +11,9 @@ class _InstanceNorm(_BatchNorm):
     def _check_input_dim(self, input):
         raise NotImplementedError
 
-    def _load_from_state_dict(self, state_dict, prefix, metadata, strict,
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
-        version = metadata.get('version', None)
+        version = local_metadata.get('version', None)
         # at version 1: removed running_mean and running_var when
         # track_running_stats=False (default)
         if version is None and not self.track_running_stats:
@@ -38,7 +38,7 @@ class _InstanceNorm(_BatchNorm):
                     state_dict.pop(key)
 
         super(_InstanceNorm, self)._load_from_state_dict(
-            state_dict, prefix, metadata, strict,
+            state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, input):
@@ -50,7 +50,7 @@ class _InstanceNorm(_BatchNorm):
 
 
 class InstanceNorm1d(_InstanceNorm):
-    r"""Applies Instance Normalization over a 2D or 3D input (a mini-batch of 1D
+    r"""Applies Instance Normalization over a 3D input (a mini-batch of 1D
     inputs with optional additional channel dimension) as described in the paper
     `Instance Normalization: The Missing Ingredient for Fast Stylization`_ .
 
@@ -83,7 +83,7 @@ class InstanceNorm1d(_InstanceNorm):
         have some subtle differences. :class:`InstanceNorm1d` is applied
         on each channel of channeled data like multidimensional time series, but
         :class:`LayerNorm` is usually applied on entire sample and often in NLP
-        tasks. Additionaly, :class:`LayerNorm` applies elementwise affine
+        tasks. Additionally, :class:`LayerNorm` applies elementwise affine
         transform, while :class:`InstanceNorm1d` usually don't apply affine
         transform.
 
@@ -118,8 +118,15 @@ class InstanceNorm1d(_InstanceNorm):
     """
 
     def _check_input_dim(self, input):
-        if input.dim() != 2 and input.dim() != 3:
-            raise ValueError('expected 2D or 3D input (got {}D input)'
+        if input.dim() == 2:
+            raise ValueError(
+                'InstanceNorm1d returns 0-filled tensor to 2D tensor.'
+                'This is because InstanceNorm1d reshapes inputs to'
+                '(1, N * C, ...) from (N, C,...) and this makes'
+                'variances 0.'
+            )
+        if input.dim() != 3:
+            raise ValueError('expected 3D input (got {}D input)'
                              .format(input.dim()))
 
 
@@ -157,7 +164,7 @@ class InstanceNorm2d(_InstanceNorm):
         have some subtle differences. :class:`InstanceNorm2d` is applied
         on each channel of channeled data like RGB images, but
         :class:`LayerNorm` is usually applied on entire sample and often in NLP
-        tasks. Additionaly, :class:`LayerNorm` applies elementwise affine
+        tasks. Additionally, :class:`LayerNorm` applies elementwise affine
         transform, while :class:`InstanceNorm2d` usually don't apply affine
         transform.
 
@@ -231,7 +238,7 @@ class InstanceNorm3d(_InstanceNorm):
         have some subtle differences. :class:`InstanceNorm3d` is applied
         on each channel of channeled data like 3D models with RGB color, but
         :class:`LayerNorm` is usually applied on entire sample and often in NLP
-        tasks. Additionaly, :class:`LayerNorm` applies elementwise affine
+        tasks. Additionally, :class:`LayerNorm` applies elementwise affine
         transform, while :class:`InstanceNorm3d` usually don't apply affine
         transform.
 

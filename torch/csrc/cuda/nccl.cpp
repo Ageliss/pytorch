@@ -1,13 +1,13 @@
-#include "nccl.h"
-#include "torch/csrc/cuda/device_set.h"
-#include "torch/csrc/utils/functional.h"
-#include "torch/csrc/utils/hash.h"
+#include <torch/csrc/cuda/nccl.h>
+#include <torch/csrc/cuda/device_set.h>
+#include <ATen/core/functional.h>
+#include <torch/csrc/utils/hash.h>
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Exception.h>
 
 #include <THC/THC.h>
-#include <THC/THCStream.h>
 
 #include <limits>
 #include <sstream>
@@ -70,7 +70,7 @@ using device_list = std::vector<int>;
 static std::unordered_map<device_list, NcclCommList, torch::hash<device_list>>
     _communicators;
 
-ArrayRef<ncclComm_t> _get_communicators(TensorList inputs) {
+ArrayRef<ncclComm_t> get_communicators(TensorList inputs) {
   static auto get_device = [](const at::Tensor& t) -> int {
     return t.get_device();
   };
@@ -81,11 +81,11 @@ ArrayRef<ncclComm_t> _get_communicators(TensorList inputs) {
   return it->second.ref();
 }
 
-ncclDataType_t _get_data_type(const Type& type) {
-  if (type.backend() != Backend::CUDA) {
+ncclDataType_t get_data_type(const Tensor& t) {
+  if (t.type().backend() != Backend::CUDA) {
     throw std::runtime_error("Unconvertible NCCL type");
   }
-  switch (type.scalarType()) {
+  switch (t.scalar_type()) {
     case at::kFloat:
       return ncclFloat;
     case at::kHalf:
@@ -105,7 +105,7 @@ ncclDataType_t _get_data_type(const Type& type) {
   }
 }
 
-void _check_inputs(
+void check_inputs(
     TensorList inputs,
     TensorList outputs,
     int input_multiplier,
@@ -126,14 +126,14 @@ void _check_inputs(
 
   device_set devices;
   int64_t numel = inputs[0].numel();
-  auto& type = inputs[0].type();
+  auto type = inputs[0].type();
 
   for (size_t i = 0; i < len; i++) {
     auto input = inputs[i];
     auto output = outputs[i];
 
-    if (!(input.type().is_cuda() && !input.type().is_sparse() &&
-          output.type().is_cuda() && !output.type().is_sparse())) {
+    if (!(input.is_cuda() && !input.is_sparse() &&
+          output.is_cuda() && !output.is_sparse())) {
       throw std::runtime_error(
           "input and output elements have to be cuda dense Tensors");
     }
@@ -178,7 +178,7 @@ bool is_available(TensorList tensors) {
 #ifdef USE_NCCL
   device_set devices;
   for (auto& tensor : tensors) {
-    auto& type = tensor.type();
+    auto type = tensor.type();
     if (!type.is_cuda() || type.is_sparse())
       return false;
     if (!tensor.is_contiguous())
@@ -232,24 +232,23 @@ void broadcast(
     const comm_list& user_comms) {
 #ifdef USE_NCCL
   using namespace torch::cuda::nccl::detail;
-  _check_inputs(tensors, tensors, 1, 1);
-  ncclDataType_t data_type = _get_data_type(tensors[0].type());
+  check_inputs(tensors, tensors, 1, 1);
+  ncclDataType_t data_type = get_data_type(tensors[0]);
   int64_t numel = tensors[0].numel();
 
-  std::lock_guard<std::mutex> free_mutex(
-      *(THCCachingAllocator_getCudaFreeMutex()));
-  const auto comms = user_comms.empty() ? _get_communicators(tensors)
+  const auto comms = user_comms.empty() ? get_communicators(tensors)
                                         : ArrayRef<ncclComm_t>(user_comms);
 
-  at::DeviceGuard device_guard;
   AutoNcclGroup nccl_group_guard;
+  at::cuda::OptionalCUDAGuard device_guard;
   for (size_t i = 0, num_tensors = tensors.size(); i < num_tensors; i++) {
     int device = tensors[i].get_device();
     device_guard.set_index(device);
+    // Default to the current stream
     const auto stream = (streams.empty() || !streams[i])
         ? at::cuda::getCurrentCUDAStream(device).stream()
         : streams[i]->stream();
-    AT_CHECK(
+    TORCH_CHECK(
         static_cast<uint64_t>(numel) <= static_cast<uint64_t>(count_max),
         "Broadcast tensor has ",
         numel,
@@ -270,36 +269,32 @@ void reduce(
     std::vector<at::Tensor>& outputs,
     int32_t root,
     int32_t op,
-    const c10::optional<stream_list>& streams,
-    const c10::optional<std::vector<ncclComm_t>>& comms) {
+    const stream_list& streams,
+    const comm_list& user_comms) {
 #ifdef USE_NCCL
   using namespace torch::cuda::nccl::detail;
-  AT_CHECK(
+  TORCH_CHECK(
       root >= 0 && static_cast<size_t>(root) < inputs.size(), "invalid root");
 
-  _check_inputs(inputs, outputs, 1, 1);
+  check_inputs(inputs, outputs, 1, 1);
   const auto len = inputs.size();
 
-  ncclDataType_t data_type = _get_data_type(inputs[0].type());
+  ncclDataType_t data_type = get_data_type(inputs[0]);
 
   const auto count = inputs[0].numel();
-  std::lock_guard<std::mutex> lock(*(THCCachingAllocator_getCudaFreeMutex()));
-  auto comms_ref =
-      comms ? _get_communicators(inputs) : ArrayRef<ncclComm_t>(*comms);
+  auto comms_ref = user_comms.empty() ? get_communicators(inputs)
+                                      : ArrayRef<ncclComm_t>(user_comms);
 
-  at::DeviceGuard device_guard;
   AutoNcclGroup nccl_group_guard;
+  at::cuda::OptionalCUDAGuard device_guard;
   for (size_t i = 0; i < len; i++) {
     int device = inputs[i].device().index();
     device_guard.set_index(device);
+    // Default to the current stream
+    const auto stream = (streams.empty() || !streams[i])
+        ? at::cuda::getCurrentCUDAStream(device).stream()
+        : streams[i]->stream();
 
-    // Default to the current  stream
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
-
-    // Two levels of optional! Wow!
-    if (streams && (*streams)[i]) {
-      stream = (*streams)[i]->stream();
-    }
     NCCL_CHECK(ncclReduce(
         inputs[i].data_ptr(),
         outputs[i].data_ptr(),
@@ -319,9 +314,9 @@ void reduce(
     std::vector<at::Tensor>& inputs,
     int32_t root,
     int32_t op,
-    const c10::optional<stream_list>& streams,
-    const c10::optional<std::vector<ncclComm_t>>& comms) {
-  reduce(inputs, /*outputs=*/inputs, root, op, streams, comms);
+    const stream_list& streams,
+    const comm_list& user_comms) {
+  reduce(inputs, /*outputs=*/inputs, root, op, streams, user_comms);
 }
 } // namespace nccl
 } // namespace cuda

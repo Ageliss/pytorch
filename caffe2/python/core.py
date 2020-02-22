@@ -14,7 +14,7 @@ from six import binary_type, string_types, text_type
 from caffe2.proto import caffe2_pb2
 from caffe2.python import scope, utils, workspace
 from caffe2.python.control_ops_grad import \
-    gen_do_gradient, gen_if_gradient, gen_while_gradient
+    gen_do_gradient, gen_if_gradient, gen_while_gradient, disambiguate_grad_if_op_output
 
 import caffe2.python._import_c_extension as C
 
@@ -80,6 +80,10 @@ def IsOperator(op_type):
 
 def IsOperatorWithEngine(op_type, engine):
     return C.op_registry_key(op_type, engine) in _REGISTERED_OPERATORS
+
+
+def IsGPUDeviceType(device_type):
+    return device_type in {caffe2_pb2.CUDA, caffe2_pb2.HIP}
 
 
 def DeviceOption(
@@ -235,6 +239,9 @@ class BlobReference(object):
     def GetNameScope(self):
         return self._name[:self._name.rfind(scope._NAMESCOPE_SEPARATOR) + 1]
 
+    def GetUnscopedName(self):
+        return self._name[self._name.rfind(scope._NAMESCOPE_SEPARATOR) + 1:]
+
     def _CreateAndAddToNet(self, op_type, inputs=None, *args, **kwargs):
         """Internal function that routes the operator generation to the
         network's __getattr__ function.
@@ -257,12 +264,12 @@ class BlobReference(object):
         if op_type.startswith('__'):
             raise AttributeError('Attribute {} not found.'.format(op_type))
         if self._from_net is None:
-            raise RuntimeError(
+            raise AttributeError(
                 'You cannot use a blob reference that does not have a net '
                 'source to create operators. Create the operator from an '
                 'explicit net object.')
         if not IsOperator(op_type):
-            raise RuntimeError(
+            raise AttributeError(
                 'Method ' + op_type + ' is not a registered operator.' +
                 ' Did you mean: [' +
                 ",".join(workspace.C.nearby_opnames(op_type)) + ']'
@@ -444,11 +451,12 @@ def GetIndexFromGradientList(g_list, name):
 
 
 OpSSA = namedtuple('OpSSA', ['op', 'in_versions', 'out_versions'])
-GradGenMeta = namedtuple('GradGenMeta', ['grad_op', 'idx', 'gradient'])
+GradGenMeta = namedtuple('GradGenMeta',
+                         ['grad_op', 'idx', 'gradient', 'device_option'])
 SparseGradGenMeta = namedtuple('SparseGradGenMeta', [
     'grad_op_indices', 'idx_indices',
     'grad_op_values', 'idx_values',
-    'gradient',
+    'gradient', 'device_option',
 ])
 
 
@@ -600,9 +608,13 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
                 else:
                     # both indices and values are generated
                     assert(len(generators) == 2)
-                    op1_i, idx1_i, op1_v, idx1_v, g1 = generators[0]
-                    op2_i, idx2_i, op2_v, idx2_v, g2 = generators[1]
+                    op1_i, idx1_i, op1_v, idx1_v, g1, dev_1 = generators[0]
+                    op2_i, idx2_i, op2_v, idx2_v, g2, dev_2 = generators[1]
                     assert(g1 == g2)
+                    assert dev_1 == dev_2, (
+                        "Unequal devices for sparse generators: "
+                        "{} and {}".format(dev1, dev2)
+                    )
                     assert(op1_i is None or op2_i is None)
                     assert(op1_v is None or op2_v is None)
                     assert(idx1_i == 0 or idx2_i == 0)
@@ -610,7 +622,7 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
                     generator = SparseGradGenMeta(
                         op1_i or op2_i, idx1_i + idx2_i,
                         op1_v or op2_v, idx1_v + idx2_v,
-                        g1)
+                        g1, dev_1)
                 self.gradient_generators[name][version].append(generator)
 
     def BuildGradientGenerators(  # NOQA
@@ -643,15 +655,17 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
                         # we'll merge indices and values generators
                         # corresponding to the same gradient in step (3)
                         if g.indices == output:
-                            m = SparseGradGenMeta(grad_op, i, None, 0, g)
+                            m = SparseGradGenMeta(
+                                grad_op, i, None, 0, g, grad_op.device_option)
                         else:
                             assert(g.values == output)
-                            m = SparseGradGenMeta(None, 0, grad_op, i, g)
+                            m = SparseGradGenMeta(
+                                None, 0, grad_op, i, g, grad_op.device_option)
                         sparse_generators[input_name][input_version].append(m)
                     else:
                         self.gradient_generators[input_name][input_version] \
                             .append(GradGenMeta(
-                                grad_op, i, g))
+                                grad_op, i, g, grad_op.device_option))
 
         # (3) merge indices and values generators for sparse gradients, and
         # add them to gradient_generators
@@ -671,11 +685,11 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
                 if str(g.indices) not in locally_generated_blobs and \
                         str(g.values) not in locally_generated_blobs:
                     self.gradient_generators[input_name][input_version].append(
-                        SparseGradGenMeta(None, 0, None, 0, g))
+                        SparseGradGenMeta(None, 0, None, 0, g, forward_op.device_option))
             else:
                 if str(g) not in locally_generated_blobs:
                     self.gradient_generators[input_name][input_version].append(
-                        GradGenMeta(None, 0, g))
+                        GradGenMeta(None, 0, g, forward_op.device_option))
 
         # Finally, for the gradients specified in g_input, we update the
         # gradient frontier to reflect the input versions that the gradients
@@ -694,12 +708,12 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
 
         for g in generator:
             if type(g) is GradGenMeta:
-                grad_op, idx, _ = g
+                grad_op, idx, _, _ = g
                 if grad_op:
                     return grad_op.output[idx]
             else:
                 assert(type(g) is SparseGradGenMeta)
-                op_i, idx_i, op_v, idx_v, _ = g
+                op_i, idx_i, op_v, idx_v, _, _ = g
                 if op_i:
                     return remove_suffix(op_i.output[idx_i], '_indices')
                 if op_v:
@@ -707,22 +721,26 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
 
         return input_name + '_grad'
 
+    IS_AUTO_GEN_SUM_OPS_TAG = "is_auto_gen_sum_ops"
+
     def _SetSumOpsDeviceOption(self, sum_ops, generators):
         # we already checked that device options are consistent so we can just
         # use the first one we find
         for generator in generators:
-            grad_op = generator.grad_op if type(generator) is GradGenMeta \
-                else generator.grad_op_values or generator.grad_op_indices
-            if grad_op:
-                if grad_op.HasField('device_option'):
-                    for op in sum_ops:
-                        op.device_option.CopyFrom(grad_op.device_option)
-                        del op.device_option.extra_info[:]
-                break
+            for op in sum_ops:
+                op.device_option.CopyFrom(generator.device_option)
+                op.device_option.extra_info.extend([
+                    "{}:1".format(IR.IS_AUTO_GEN_SUM_OPS_TAG)
+                ])
+            break
 
     def _DisambiguateGradOpOutput(self, grad_op, idx, cnt):
-        grad_op.output[idx] = (
+        new_grad_output = (
             '_' + grad_op.output[idx] + '_autosplit_{}'.format(cnt))
+        if grad_op.type == "If":
+            disambiguate_grad_if_op_output(grad_op, idx, new_grad_output)
+        else:
+            grad_op.output[idx] = new_grad_output
         return grad_op.output[idx], cnt + 1
 
     def _CheckSumOpsConflict(self, out_base_name, g):
@@ -741,7 +759,7 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
 
         first_grad_op = True
         for generator in generators:
-            grad_op, idx, g = generator
+            grad_op, idx, g, _ = generator
             assert(type(g) is not GradientSlice)
             if grad_op:
                 if first_grad_op:
@@ -775,7 +793,7 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
 
         for generator in generators:
             assert(type(generator) is SparseGradGenMeta)
-            op_i, idx_i, op_v, idx_v, g = generator
+            op_i, idx_i, op_v, idx_v, g, _ = generator
             if op_i:
                 out, cnt_i = self._DisambiguateGradOpOutput(op_i, idx_i, cnt_i)
                 indices_concat_input.append(out)
@@ -849,16 +867,14 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
         all_gradient_names = []
         all_device_options = []
         for g in generator:
+            if g.device_option:
+                all_device_options.append(g.device_option)
             if type(g) is GradGenMeta:
                 if g.grad_op:
                     all_gradient_names.append(g.gradient)
-                    all_device_options.append(g.grad_op.device_option)
             else:
                 assert(type(g) is SparseGradGenMeta)
-                if g.grad_op_indices:
-                    all_device_options.append(g.grad_op_indices.device_option)
-                if g.grad_op_values:
-                    all_device_options.append(g.grad_op_values.device_option)
+                if g.gradient.values:
                     all_gradient_names.append(g.gradient.values)
 
         # Check if all grad op device options are the same.
@@ -920,7 +936,8 @@ StopGradient. Op:\n\n{}""".format(op.output[0], str(op)))
         # a ConstantFill operator. Autogeneration for sparse gradients is
         # not supported
         generator = GradGenMeta(
-            autograd_op, 0 if autograd_op else None, str(grad))
+            autograd_op, 0 if autograd_op else None, str(grad),
+            autograd_op.device_option)
 
         self.gradient_generators[str(y)][self.frontier[str(y)]].append(
             generator)
@@ -1481,6 +1498,12 @@ class Net(object):
         if device_option is not None:
             ops = [copy.deepcopy(op) for op in ops]
             map(lambda x: x.device_option.CopyFrom(device_option), ops)
+            for op in ops:
+                if op.type == "RecurrentNetwork":
+                    for arg in op.arg:
+                        if arg.name.endswith('step_net'):
+                            for step_op in arg.n.op:
+                                step_op.device_option.CopyFrom(device_option)
 
         self._ExtendOps(ops)
         return self
@@ -2107,15 +2130,28 @@ class Net(object):
             raise ValueError('{} is not supported'.format(aggregator))
         return GradientSlice(indices=unique, values=new_g)
 
+    @staticmethod
+    def _RunAllOnGPU(net, gpu_id=0, use_cudnn=False):
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.device_type = workspace.GpuDeviceType
+        device_option.device_id = gpu_id
+        net.device_option.CopyFrom(device_option)
+        if use_cudnn:
+            for op in net.op:
+                op.engine = "CUDNN"
+        # Move RecurrentNetwork operators on GPU as well
+        for op in net.op:
+            if op.type != "RecurrentNetwork":
+                continue
+            for arg in op.arg:
+                if arg.name == "step_net":
+                    Net._RunAllOnGPU(arg.n, gpu_id, use_cudnn)
+
     def RunAllOnGPU(self, gpu_id=0, use_cudnn=False):
         """A convenient function to run everything on the GPU."""
-        device_option = caffe2_pb2.DeviceOption()
-        device_option.device_type = caffe2_pb2.CUDA
-        device_option.device_id = gpu_id
-        self._net.device_option.CopyFrom(device_option)
-        if use_cudnn:
-            for op in self._net.op:
-                op.engine = "CUDNN"
+        self._RunAllOnGPU(self._net, gpu_id, use_cudnn)
+
+
 
     def RunAllOnMKL(self):
         """A convenient function to run everything using MKLDNN."""
@@ -2280,12 +2316,13 @@ def remap_input(op, blob_name_remapping):
 
 def copy_func_between_devices(src, dst):
     CPU = caffe2_pb2.CPU
-    CUDA = caffe2_pb2.CUDA
+    is_src_gpu = IsGPUDeviceType(src.device_type)
+    is_dst_gpu = IsGPUDeviceType(dst.device_type)
 
     if src.device_type == CPU and dst.device_type == CPU:
         return None
 
-    if src.device_type == CUDA and dst.device_type == CUDA:
+    if is_src_gpu and is_dst_gpu:
         if src.device_id == dst.device_id:
             return None
         else:
@@ -2294,13 +2331,13 @@ def copy_func_between_devices(src, dst):
                     return net.Copy(*args, **kw)
             return fun
 
-    if src.device_type == CUDA and dst.device_type == CPU:
+    if is_src_gpu and dst.device_type == CPU:
         def fun(net, *args, **kw):
             with DeviceScope(src):
                 return net.CopyGPUToCPU(*args, **kw)
         return fun
 
-    if src.device_type == CPU and dst.device_type == CUDA:
+    if src.device_type == CPU and is_dst_gpu:
         def fun(net, *args, **kw):
             with DeviceScope(dst):
                 return net.CopyCPUToGPU(*args, **kw)
@@ -2425,11 +2462,10 @@ def InjectCrossDeviceCopies(net, blob_to_device=None, blob_remap=None,
 
                     def _gen_new_name(blob, device_option):
                         CPU = caffe2_pb2.CPU
-                        CUDA = caffe2_pb2.CUDA
                         if device_option.device_type == CPU:
                             suffix = '_cpu'
-                        elif device_option.device_type == CUDA:
-                            suffix = '_cuda_' + str(device_option.device_id)
+                        elif IsGPUDeviceType(device_option.device_type):
+                            suffix = '_gpu_' + str(device_option.device_id)
                         else:
                             raise RuntimeError(
                                 "Unknown device type: {}".
@@ -2936,8 +2972,8 @@ def _extract_stacktrace():
     This function extracts stacktrace without file system access
     by purely using sys._getframe() and removes part that belongs to
     this file (core.py). We are not using inspect module because
-    its just a wrapper on top of sys._getframe() whos
-    logis is based on accessing source files on disk - exactly what
+    its just a wrapper on top of sys._getframe() whose
+    logic is based on accessing source files on disk - exactly what
     we are trying to avoid here. Same stands for traceback module
 
     The reason for file system access avoidance is that

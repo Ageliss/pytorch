@@ -1,4 +1,4 @@
-from common_utils import TestCase, run_tests, TEST_NUMPY, load_tests
+from torch.testing._internal.common_utils import TestCase, run_tests, TEST_NUMPY, load_tests
 
 # load_tests from common_utils is used to automatically filter tests for
 # sharding on sandcastle. This line silences flake warnings
@@ -31,6 +31,7 @@ class TestDTypeInfo(TestCase):
             xninfo = np.iinfo(xn.dtype)
             self.assertEqual(xinfo.bits, xninfo.bits)
             self.assertEqual(xinfo.max, xninfo.max)
+            self.assertEqual(xinfo.min, xninfo.min)
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_finfo(self):
@@ -42,6 +43,7 @@ class TestDTypeInfo(TestCase):
             xninfo = np.finfo(xn.dtype)
             self.assertEqual(xinfo.bits, xninfo.bits)
             self.assertEqual(xinfo.max, xninfo.max)
+            self.assertEqual(xinfo.min, xninfo.min)
             self.assertEqual(xinfo.eps, xninfo.eps)
             self.assertEqual(xinfo.tiny, xninfo.tiny)
             torch.set_default_dtype(dtype)

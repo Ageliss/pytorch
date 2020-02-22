@@ -2,6 +2,7 @@
 #define C10_UTIL_STRINGUTIL_H_
 
 #include <c10/macros/Macros.h>
+#include <c10/util/string_utils.h>
 
 #include <cstddef>
 #include <ostream>
@@ -15,6 +16,17 @@ namespace detail {
 
 // Obtains the base name from a full path.
 C10_API std::string StripBasename(const std::string& full_path);
+
+template <typename T>
+struct CanonicalizeStrTypes {
+  using type = const T&;
+};
+
+template <size_t N>
+struct CanonicalizeStrTypes<char[N]> {
+  using type = const char *;
+};
+
 
 inline std::ostream& _str(std::ostream& ss) {
   return ss;
@@ -31,14 +43,19 @@ inline std::ostream& _str(std::ostream& ss, const T& t, const Args&... args) {
   return _str(_str(ss, t), args...);
 }
 
+template <typename... Args>
+inline std::string _str_wrapper(const Args&... args) {
+    std::ostringstream ss;
+    _str(ss, args...);
+    return ss.str();
+}
+
 } // namespace detail
 
 // Convert a list of string-like arguments into a single string.
 template <typename... Args>
 inline std::string str(const Args&... args) {
-  std::ostringstream ss;
-  detail::_str(ss, args...);
-  return ss.str();
+  return detail::_str_wrapper<typename detail::CanonicalizeStrTypes<Args>::type...>(args...);
 }
 
 // Specializations for already-a-string types.
@@ -73,28 +90,65 @@ struct C10_API SourceLocation {
 
 std::ostream& operator<<(std::ostream& out, const SourceLocation& loc);
 
-/// Portable implementation of std::stoi, which works for Android builds.
-///
-/// TODO: You won't be able to call this unqualified, because ADL means that it
-/// will be ambiguous with std::stoi.  Maybe we should fix this by giving
-/// our version a different name.
-inline int stoi(const std::string& str) {
-#if defined(__ANDROID__)
-  std::stringstream ss;
-  int n = 0;
-  ss << str;
-  ss >> n;
-  return n;
-#else
-  return std::stoi(str);
-#endif // defined(__ANDROID__)
+// unix isprint but insensitive to locale
+inline static bool isPrint(char s) {
+  return s > 0x1f && s < 0x7f;
+}
+
+inline void printQuotedString(std::ostream& stmt, const std::string& str) {
+  stmt << "\"";
+  for (auto s : str) {
+    switch (s) {
+      case '\\':
+        stmt << "\\\\";
+        break;
+      case '\'':
+        stmt << "\\'";
+        break;
+      case '\"':
+        stmt << "\\\"";
+        break;
+      case '\a':
+        stmt << "\\a";
+        break;
+      case '\b':
+        stmt << "\\b";
+        break;
+      case '\f':
+        stmt << "\\f";
+        break;
+      case '\n':
+        stmt << "\\n";
+        break;
+      case '\r':
+        stmt << "\\r";
+        break;
+      case '\t':
+        stmt << "\\t";
+        break;
+      case '\v':
+        stmt << "\\v";
+        break;
+      default:
+        if (isPrint(s)) {
+          stmt << s;
+        } else {
+          // C++ io has stateful formatting settings. Messing with
+          // them is probably worse than doing this manually.
+          char buf[4] = "000";
+          buf[2] += s % 8;
+          s /= 8;
+          buf[1] += s % 8;
+          s /= 8;
+          buf[0] += s;
+          stmt << "\\" << buf;
+        }
+        break;
+    }
+  }
+  stmt << "\"";
 }
 
 } // namespace c10
-
-// TODO: Remove me when namespace unification occurs
-namespace at {
-using c10::stoi;
-}
 
 #endif // C10_UTIL_STRINGUTIL_H_

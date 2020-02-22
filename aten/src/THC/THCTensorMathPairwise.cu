@@ -1,11 +1,11 @@
-#include "THCTensorMath.h"
-#include "THCGeneral.h"
-#include "TH/THHalf.h"
-#include "THCTensorCopy.h"
-#include "THCApply.cuh"
-#include "THCNumerics.cuh"
-#include "THCTensorMathCompareT.cuh"
-#include "THCTensor.hpp"
+#include <THC/THCTensorMath.h>
+#include <THC/THCGeneral.h>
+#include <TH/THHalf.h>
+#include <THC/THCTensorCopy.h>
+#include <THC/THCApply.cuh>
+#include <THC/THCNumerics.cuh>
+#include <THC/THCTensorMathCompareT.cuh>
+#include <THC/THCTensor.hpp>
 
 template <typename T>
 struct TensorAddConstantOp {
@@ -231,75 +231,8 @@ struct TensorTriOp {
   const int64_t stride0, stride1, k;
 };
 
-template <typename T>
-struct TensorLShiftConstantOp {
-  TensorLShiftConstantOp(T v) : val(v) {}
-  __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = *in << val;
-  }
+#include <THC/generic/THCTensorMathPairwise.cu>
+#include <THC/THCGenerateAllTypes.h>
 
-  __device__ __forceinline__ void operator()(T* v) {
-    *v <<= val;
-  }
-
-  const T val;
-};
-
-template <typename T>
-struct TensorRShiftConstantOp {
-  TensorRShiftConstantOp(T v) : val(v) {}
-  __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = *in >> val;
-  }
-
-  __device__ __forceinline__ void operator()(T* v) {
-    *v >>= val;
-  }
-
-  const T val;
-};
-
-template <typename T>
-struct TensorBitAndConstantOp {
-  TensorBitAndConstantOp(T v) : val(v) {}
-  __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = *in & val;
-  }
-
-  __device__ __forceinline__ void operator()(T* v) {
-    *v &= val;
-  }
-
-  const T val;
-};
-
-template <typename T>
-struct TensorBitOrConstantOp {
-  TensorBitOrConstantOp(T v) : val(v) {}
-  __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = *in | val;
-  }
-
-  __device__ __forceinline__ void operator()(T* v) {
-    *v |= val;
-  }
-
-  const T val;
-};
-
-template <typename T>
-struct TensorBitXorConstantOp {
-  TensorBitXorConstantOp(T v) : val(v) {}
-  __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = *in ^ val;
-  }
-
-  __device__ __forceinline__ void operator()(T* v) {
-    *v ^= val;
-  }
-
-  const T val;
-};
-
-#include "generic/THCTensorMathPairwise.cu"
-#include "THCGenerateAllTypes.h"
+#include <THC/generic/THCTensorMathPairwise.cu>
+#include <THC/THCGenerateBoolType.h>

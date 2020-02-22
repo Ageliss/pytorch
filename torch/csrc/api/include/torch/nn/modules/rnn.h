@@ -1,9 +1,11 @@
 #pragma once
 
 #include <torch/nn/cloneable.h>
+#include <torch/nn/options/rnn.h>
+#include <torch/nn/modules/common.h>
 #include <torch/nn/modules/dropout.h>
 #include <torch/nn/pimpl.h>
-#include <torch/tensor.h>
+#include <torch/types.h>
 
 #include <ATen/ATen.h>
 #include <c10/util/Exception.h>
@@ -17,7 +19,7 @@ namespace torch {
 namespace nn {
 
 /// The output of a single invocation of an RNN module's `forward()` method.
-struct RNNOutput {
+struct TORCH_API RNNOutput {
   /// The result of applying the specific RNN algorithm
   /// to the input tensor and input state.
   Tensor output;
@@ -27,40 +29,16 @@ struct RNNOutput {
 };
 
 namespace detail {
-
-/// Common options for LSTM and GRU modules.
-struct RNNOptionsBase {
-  RNNOptionsBase(int64_t input_size, int64_t hidden_size);
-  virtual ~RNNOptionsBase() = default;
-  /// The number of features of a single sample in the input sequence `x`.
-  TORCH_ARG(int64_t, input_size);
-  /// The number of features in the hidden state `h`.
-  TORCH_ARG(int64_t, hidden_size);
-  /// The number of recurrent layers (cells) to use.
-  TORCH_ARG(int64_t, layers) = 1;
-  /// Whether a bias term should be added to all linear operations.
-  TORCH_ARG(bool, with_bias) = true;
-  /// If non-zero, adds dropout with the given probability to the output of each
-  /// RNN layer, except the final layer.
-  TORCH_ARG(double, dropout) = 0.0;
-  /// Whether to make the RNN bidirectional.
-  TORCH_ARG(bool, bidirectional) = false;
-  /// If true, the input sequence should be provided as `(batch, sequence,
-  /// features)`. If false (default), the expected layout is `(sequence, batch,
-  /// features)`.
-  TORCH_ARG(bool, batch_first) = false;
-};
-
 /// Base class for all RNN implementations (intended for code sharing).
 template <typename Derived>
-class RNNImplBase : public torch::nn::Cloneable<Derived> {
+class TORCH_API RNNImplBase : public torch::nn::Cloneable<Derived> {
  public:
   /// These must line up with the CUDNN mode codes:
   /// https://docs.nvidia.com/deeplearning/sdk/cudnn-developer-guide/index.html#cudnnRNNMode_t
   enum class CuDNNMode { RNN_RELU = 0, RNN_TANH = 1, LSTM = 2, GRU = 3 };
 
   explicit RNNImplBase(
-      RNNOptionsBase options_,
+      const RNNOptionsBase& options_,
       optional<CuDNNMode> cudnn_mode = nullopt,
       int64_t number_of_gates = 1);
 
@@ -73,6 +51,9 @@ class RNNImplBase : public torch::nn::Cloneable<Derived> {
       override;
   void to(torch::Dtype dtype, bool non_blocking = false) override;
   void to(torch::Device device, bool non_blocking = false) override;
+
+  /// Pretty prints the RNN module into the given `stream`.
+  void pretty_print(std::ostream& stream) const override;
 
   /// Modifies the internal storage of weights for optimization purposes.
   ///
@@ -97,7 +78,7 @@ class RNNImplBase : public torch::nn::Cloneable<Derived> {
   std::vector<Tensor> b_hh;
 
  protected:
-  /// The function signature of `at::rnn_relu`, `at::rnn_tanh` and `at::gru`.
+  /// The function signature of `rnn_relu`, `rnn_tanh` and `gru`.
   using RNNFunctionSignature = std::tuple<Tensor, Tensor>(
       /*input=*/const Tensor&,
       /*state=*/const Tensor&,
@@ -113,7 +94,7 @@ class RNNImplBase : public torch::nn::Cloneable<Derived> {
   /// RNN function as first argument.
   RNNOutput generic_forward(
       std::function<RNNFunctionSignature> function,
-      Tensor input,
+      const Tensor& input,
       Tensor state);
 
   /// Returns a flat vector of all weights, with layer weights following each
@@ -136,52 +117,25 @@ class RNNImplBase : public torch::nn::Cloneable<Derived> {
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RNN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-enum class RNNActivation { ReLU, Tanh };
-
-/// Options for RNN modules.
-struct RNNOptions {
-  RNNOptions(int64_t input_size, int64_t hidden_size);
-
-  /// Sets the activation after linear operations to `tanh`.
-  RNNOptions& tanh();
-  /// Sets the activation after linear operations to `relu`.
-  RNNOptions& relu();
-
-  /// The number of features of a single sample in the input sequence `x`.
-  TORCH_ARG(int64_t, input_size);
-  /// The number of features in the hidden state `h`.
-  TORCH_ARG(int64_t, hidden_size);
-  /// The number of recurrent layers (cells) to use.
-  TORCH_ARG(int64_t, layers) = 1;
-  /// Whether a bias term should be added to all linear operations.
-  TORCH_ARG(bool, with_bias) = true;
-  /// If non-zero, adds dropout with the given probability to the output of each
-  /// RNN layer, except the final layer.
-  TORCH_ARG(double, dropout) = 0.0;
-  /// Whether to make the RNN bidirectional.
-  TORCH_ARG(bool, bidirectional) = false;
-  /// If true, the input sequence should be provided as `(batch, sequence,
-  /// features)`. If false (default), the expected layout is `(sequence, batch,
-  /// features)`.
-  TORCH_ARG(bool, batch_first) = false;
-  /// The activation to use after linear operations.
-  TORCH_ARG(RNNActivation, activation) = RNNActivation::ReLU;
-};
-
 /// A multi-layer Elman RNN module with Tanh or ReLU activation.
 /// See https://pytorch.org/docs/master/nn.html#torch.nn.RNN to learn about the
 /// exact behavior of this module.
-class RNNImpl : public detail::RNNImplBase<RNNImpl> {
+class TORCH_API RNNImpl : public detail::RNNImplBase<RNNImpl> {
  public:
   RNNImpl(int64_t input_size, int64_t hidden_size)
       : RNNImpl(RNNOptions(input_size, hidden_size)) {}
-  explicit RNNImpl(RNNOptions options);
+  explicit RNNImpl(const RNNOptions& options_);
+
+  /// Pretty prints the `RNN` module into the given `stream`.
+  void pretty_print(std::ostream& stream) const override;
 
   /// Applies the `RNN` module to an input sequence and input state.
   /// The `input` should follow a `(sequence, batch, features)` layout unless
   /// `batch_first` is true, in which case the layout should be `(batch,
   /// sequence, features)`.
-  RNNOutput forward(Tensor input, Tensor state = {});
+  RNNOutput forward(const Tensor& input, Tensor state = {});
+ protected:
+  FORWARD_HAS_DEFAULT_ARGS({1, AnyValue(Tensor())})
 
   RNNOptions options;
 };
@@ -194,22 +148,22 @@ TORCH_MODULE(RNN);
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LSTM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-using LSTMOptions = detail::RNNOptionsBase;
-
 /// A multi-layer long-short-term-memory (LSTM) module.
 /// See https://pytorch.org/docs/master/nn.html#torch.nn.LSTM to learn about the
 /// exact behavior of this module.
-class LSTMImpl : public detail::RNNImplBase<LSTMImpl> {
+class TORCH_API LSTMImpl : public detail::RNNImplBase<LSTMImpl> {
  public:
   LSTMImpl(int64_t input_size, int64_t hidden_size)
       : LSTMImpl(LSTMOptions(input_size, hidden_size)) {}
-  explicit LSTMImpl(LSTMOptions options);
+  explicit LSTMImpl(const LSTMOptions& options_);
 
   /// Applies the `LSTM` module to an input sequence and input state.
   /// The `input` should follow a `(sequence, batch, features)` layout unless
   /// `batch_first` is true, in which case the layout should be `(batch,
   /// sequence, features)`.
-  RNNOutput forward(Tensor input, Tensor state = {});
+  RNNOutput forward(const Tensor& input, Tensor state = {});
+ protected:
+  FORWARD_HAS_DEFAULT_ARGS({1, AnyValue(Tensor())})
 };
 
 /// A `ModuleHolder` subclass for `LSTMImpl`.
@@ -220,22 +174,22 @@ TORCH_MODULE(LSTM);
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ GRU ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-using GRUOptions = detail::RNNOptionsBase;
-
 /// A multi-layer gated recurrent unit (GRU) module.
 /// See https://pytorch.org/docs/master/nn.html#torch.nn.GRU to learn about the
 /// exact behavior of this module.
-class GRUImpl : public detail::RNNImplBase<GRUImpl> {
+class TORCH_API GRUImpl : public detail::RNNImplBase<GRUImpl> {
  public:
   GRUImpl(int64_t input_size, int64_t hidden_size)
       : GRUImpl(GRUOptions(input_size, hidden_size)) {}
-  explicit GRUImpl(GRUOptions options);
+  explicit GRUImpl(const GRUOptions& options_);
 
   /// Applies the `GRU` module to an input sequence and input state.
   /// The `input` should follow a `(sequence, batch, features)` layout unless
   /// `batch_first` is true, in which case the layout should be `(batch,
   /// sequence, features)`.
-  RNNOutput forward(Tensor input, Tensor state = {});
+  RNNOutput forward(const Tensor& input, Tensor state = {});
+ protected:
+  FORWARD_HAS_DEFAULT_ARGS({1, AnyValue(Tensor())})
 };
 
 /// A `ModuleHolder` subclass for `GRUImpl`.

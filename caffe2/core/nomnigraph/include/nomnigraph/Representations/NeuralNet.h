@@ -153,7 +153,6 @@ class CAFFE2_API NeuralNetData : public Data {
 
  private:
   NNDataKind kind_;
-  size_t version_ = 0;
 };
 
 class CAFFE2_API Tensor : public NeuralNetData {
@@ -184,6 +183,11 @@ class CAFFE2_API Tensor : public NeuralNetData {
   const std::string getName() const {
     return name_;
   }
+
+  void setName(const std::string& name) {
+    name_ = name;
+  }
+
   ~Tensor() {}
 
  private:
@@ -250,7 +254,7 @@ struct CAFFE2_API NNModule {
   NNModule(NNModule&&) = default;
   NNModule() {}
 
-  /* Repalce subgraph sg by node, using the order of
+  /* Replace subgraph sg by node, using the order of
    * node_inputs and node_outputs to determine how to link
    * them to the node.  node_inputs *must* enumerate all the
    * inputs to the subgraph (NeuralNetData that do not

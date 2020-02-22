@@ -4,7 +4,7 @@
 #include "caffe2/core/context.h"
 #include "caffe2/core/operator.h"
 #include "caffe2/core/tensor.h"
-#include "caffe2/core/typeid.h"
+#include <c10/util/typeid.h>
 
 namespace caffe2 {
 
@@ -84,7 +84,7 @@ inline void DecodeGeneral(
                         REGISTER_DECODER(float, uint16_t),
                         REGISTER_DECODER(float, int32_t)};
 
-  gDecoderMapper.at({codebook.meta().id(), codes.meta().id()})(
+  gDecoderMapper.at({codebook.dtype().id(), codes.dtype().id()})(
       codebook, codes, gradient, outDecoded, resizeOnly);
 }
 
@@ -102,8 +102,9 @@ template <QuantDecodeRunTy QuantDecodeRun>
 class QuantDecodeOp final : public Operator<CPUContext> {
  public:
   USE_OPERATOR_FUNCTIONS(CPUContext);
-  QuantDecodeOp(const OperatorDef& operator_def, Workspace* ws)
-      : Operator<CPUContext>(operator_def, ws) {}
+  template <class... Args>
+  explicit QuantDecodeOp(Args&&... args)
+      : Operator<CPUContext>(std::forward<Args>(args)...) {}
 
   ~QuantDecodeOp() {}
 
@@ -113,7 +114,7 @@ class QuantDecodeOp final : public Operator<CPUContext> {
     CAFFE_ENFORCE_EQ(InputSize(), OutputSize() + 1);
 
     const auto& codebook = Input(0);
-    CAFFE_ENFORCE(codebook.template IsType<float>(), codebook.meta().name());
+    CAFFE_ENFORCE(codebook.template IsType<float>(), codebook.dtype().name());
 
     for (int i = 0; i < OutputSize(); i++) {
       auto& ci = Input(i + 1);
@@ -138,8 +139,9 @@ class QuantDecodeOp final : public Operator<CPUContext> {
 class QuantDecodeGradientOp final : public Operator<CPUContext> {
  public:
   USE_OPERATOR_FUNCTIONS(CPUContext);
-  QuantDecodeGradientOp(const OperatorDef& operator_def, Workspace* ws)
-      : Operator<CPUContext>(operator_def, ws) {}
+  template <class... Args>
+  explicit QuantDecodeGradientOp(Args&&... args)
+      : Operator<CPUContext>(std::forward<Args>(args)...) {}
   ~QuantDecodeGradientOp() {}
 
   bool RunOnDevice() override {
@@ -149,10 +151,9 @@ class QuantDecodeGradientOp final : public Operator<CPUContext> {
     CAFFE_ENFORCE_EQ(OutputSize(), 1);
 
     const auto& codebook = Input(0);
-    CAFFE_ENFORCE(codebook.template IsType<float>(), codebook.meta().name());
+    CAFFE_ENFORCE(codebook.template IsType<float>(), codebook.dtype().name());
 
-    auto* gradient = Output(0);
-    gradient->ResizeLike(codebook);
+    auto* gradient = Output(0, codebook.sizes(), at::dtype<float>());
     auto* gradient_ptr = gradient->template mutable_data<float>();
     std::fill(gradient_ptr, gradient_ptr + gradient->numel(), 0);
 

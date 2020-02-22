@@ -140,9 +140,9 @@ class TestBatchMatMul(serial.SerializedTestCase):
     )
     def test_batch_matmul(self, C, M, K, N, trans_a, trans_b, dtype, gc, dc):
         if dtype == np.float16:
-            # fp16 is only supported with CUDA
-            assume(gc.device_type == caffe2_pb2.CUDA)
-            dc = [d for d in dc if d.device_type == caffe2_pb2.CUDA]
+            # fp16 is only supported with CUDA/HIP
+            assume(core.IsGPUDeviceType(gc.device_type))
+            dc = [d for d in dc if core.IsGPUDeviceType(d.device_type)]
 
         batch_dims = np.random.randint(
             low=1,
@@ -226,7 +226,6 @@ class TestBatchMatMul(serial.SerializedTestCase):
         **hu.gcs
     )
     def test_numpy_batch_matmul(self, C_1, C_2, M, K, N, trans_a, trans_b, gc, dc):
-        np.set_printoptions(threshold=np.nan)
         dtype = np.float32
         batch_dims = np.random.randint(
             low=0,
@@ -249,7 +248,6 @@ class TestBatchMatMul(serial.SerializedTestCase):
         **hu.gcs
     )
     def test_numpy_batch_matmul_1d(self, K, gc, dc):
-        np.set_printoptions(threshold=np.nan)
         dtype = np.float32
         X = np.random.rand(K).astype(dtype) - 0.5
         # TODO: test trans_a and trans_b
@@ -264,7 +262,6 @@ class TestBatchMatMul(serial.SerializedTestCase):
         **hu.gcs
     )
     def test_numpy_batch_matmul_1d_2d(self, K, N, gc, dc):
-        np.set_printoptions(threshold=np.nan)
         dtype = np.float32
         X = np.random.rand(K).astype(dtype) - 0.5
         # TODO: test trans_a and trans_b
@@ -279,7 +276,6 @@ class TestBatchMatMul(serial.SerializedTestCase):
         **hu.gcs
     )
     def test_numpy_batch_matmul_2d_1d(self, M, K, gc, dc):
-        np.set_printoptions(threshold=np.nan)
         dtype = np.float32
         X = np.random.rand(*[M, K]).astype(dtype) - 0.5
         # TODO: test trans_a and trans_b

@@ -1,16 +1,30 @@
 # This file solely exists to let Caffe2 Android build get at the list
 # of core files without having to trundle through all of ATen's CMakeLists.txt
 
-FILE(GLOB ATen_CORE_HEADERS "*.h")
-FILE(GLOB ATen_CORE_SRCS "*.cpp")
-FILE(GLOB ATen_CORE_TEST_SRCS "*_test.cpp")
+FILE(GLOB_RECURSE ATen_CORE_HEADERS "*.h")
+FILE(GLOB_RECURSE ATen_CORE_SRCS "*.cpp")
+FILE(GLOB_RECURSE ATen_CORE_TEST_SRCS "*_test.cpp")
 EXCLUDE(ATen_CORE_SRCS "${ATen_CORE_SRCS}" ${ATen_CORE_TEST_SRCS})
 
-# see the source file for explanation
-set_source_files_properties(
-  ${CMAKE_CURRENT_SOURCE_DIR}/register_symbols.cpp
-  PROPERTIES COMPILE_FLAGS -O0
-  )
+# Add files needed from jit folders
+LIST(APPEND ATen_CORE_HEADERS
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/source_range.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/function_schema_parser.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/lexer.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/strtod.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/parse_string_literal.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/schema_type_parser.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/error_report.h
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/tree.h
+)
+LIST(APPEND ATen_CORE_SRCS
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/error_report.cpp
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/function_schema_parser.cpp
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/lexer.cpp
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/strtod.cpp
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/script/schema_type_parser.cpp
+    ${Caffe2_SOURCE_DIR}/torch/csrc/jit/source_range.cpp
+)
 
 # Pass to parent
 set(ATen_CORE_HEADERS ${ATen_CORE_HEADERS} PARENT_SCOPE)

@@ -7,7 +7,6 @@ from caffe2.python import recurrent, workspace
 from caffe2.python.model_helper import ModelHelper
 from hypothesis import given
 import caffe2.python.hypothesis_test_util as hu
-from caffe2.python.test_util import IN_CIRCLECI_FLAKY_ENV
 import caffe2.python.serialized_test.serialized_test_util as serial
 import hypothesis.strategies as st
 import numpy as np
@@ -16,7 +15,6 @@ import os
 import unittest
 
 class RecurrentNetworkTest(serial.SerializedTestCase):
-    @unittest.skipIf(IN_CIRCLECI_FLAKY_ENV, "FIXME: flaky test in CircleCI")
     @given(T=st.integers(1, 4),
            n=st.integers(1, 5),
            d=st.integers(1, 5))
@@ -267,7 +265,7 @@ class RecurrentNetworkTest(serial.SerializedTestCase):
         since there is no enough element of input_state sequence are available.
         So the initial_state for input_state contains several elements
         (exactly how many pads we need for the first step). Also, because of
-        that all offseting over input_state sequnece is being shifted
+        that all offseting over input_state sequence is being shifted
         by length of initial_input_state: see `link_offset` and `alias_offset`
         arguments of RecurrentNetwork.
 

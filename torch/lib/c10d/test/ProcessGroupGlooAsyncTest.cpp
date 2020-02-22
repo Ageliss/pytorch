@@ -1,11 +1,8 @@
-#include <gloo/transport/tcp/device.h>
+#include <ATen/cuda/CUDAMultiStreamGuard.h>
+#include <c10/cuda/CUDAGuard.h>
 
-#include <ATen/cuda/CUDAGuard.h>
-
-#include <c10d/CUDAUtils.hpp>
 #include <c10d/FileStore.hpp>
 #include <c10d/ProcessGroupGloo.hpp>
-#include <c10d/private/CUDAUtils.hpp>
 #include <c10d/test/CUDATest.hpp>
 #include <c10d/test/TestUtils.hpp>
 
@@ -47,13 +44,13 @@ class AsyncTest {
   }
 
   void start(int rank, int size) {
-    auto store = std::make_shared<::c10d::FileStore>(path_);
+    auto store = std::make_shared<::c10d::FileStore>(path_, size);
 
     // Use tiny timeout to make this test run fast
     ::c10d::ProcessGroupGloo::Options options;
     options.timeout = std::chrono::milliseconds(50);
-    ::gloo::transport::tcp::attr attr;
-    options.devices.push_back(::gloo::transport::tcp::CreateDevice(attr));
+    options.devices.push_back(
+        ::c10d::ProcessGroupGloo::createDeviceForHostname("127.0.0.1"));
 
     pg_ = std::unique_ptr<::c10d::ProcessGroupGloo>(
         new ::c10d::ProcessGroupGloo(store, rank, size, options));
@@ -87,7 +84,7 @@ class AsyncInputIsOutputTest : public AsyncTest {
     // and pass this along to the collective (since it uses the THC
     // getters to retrieve the current stream).
     //
-    at::DeviceGuard deviceGuard;
+    at::cuda::OptionalCUDAGuard deviceGuard;
     streams_.reserve(numDevices_);
     for (auto i = 0; i < numDevices_; i++) {
       deviceGuard.set_index(i);
@@ -95,26 +92,16 @@ class AsyncInputIsOutputTest : public AsyncTest {
     }
   }
 
-  std::vector<at::cuda::CUDAGuard> createStreamGuard() {
-    std::vector<at::cuda::CUDAGuard> guards;
-    for (auto& stream : streams_) {
-      guards.push_back(at::cuda::CUDAGuard(stream));
-    }
-    return guards;
-  }
-
   void wait(std::shared_ptr<ProcessGroup::Work>& work) {
-    auto guards = createStreamGuard();
-    if (!work->wait()) {
-      throw work->exception();
-    }
+    at::cuda::CUDAMultiStreamGuard guard(streams_);
+    work->wait();
   }
 
   std::vector<at::Tensor> getTensors() {
     std::vector<at::Tensor> outputs(numTensors_);
 
     // For the duration of this function, make THC use our streams
-    auto guards = createStreamGuard();
+    at::cuda::CUDAMultiStreamGuard guard(streams_);
 
     // Copy inputs to outputs
     for (auto i = 0; i < numTensors_; i++) {
@@ -139,10 +126,10 @@ class AsyncAllreduceTest : public AsyncInputIsOutputTest {
 
   std::shared_ptr<c10d::ProcessGroup::Work> run() {
     // For the duration of this function, make THC use our streams
-    auto guards = createStreamGuard();
+    at::cuda::CUDAMultiStreamGuard guard(streams_);
 
     // Launch sleep on every stream
-    at::DeviceGuard deviceGuard;
+    at::cuda::OptionalCUDAGuard deviceGuard;
     for (auto i = 0; i < numDevices_; i++) {
       deviceGuard.set_index(i);
       cudaSleep(streams_[i], 10 * 1000 * 1000);
@@ -165,10 +152,10 @@ class AsyncBroadcastTest : public AsyncInputIsOutputTest {
 
   std::shared_ptr<c10d::ProcessGroup::Work> run(int rootRank, int rootTensor) {
     // For the duration of this function, make THC use our streams
-    auto guards = createStreamGuard();
+    at::cuda::CUDAMultiStreamGuard guard(streams_);
 
     // Launch sleep on every stream
-    at::DeviceGuard deviceGuard;
+    at::cuda::OptionalCUDAGuard deviceGuard;
     for (auto i = 0; i < numDevices_; i++) {
       deviceGuard.set_index(i);
       cudaSleep(streams_[i], 10 * 1000 * 1000);
@@ -209,7 +196,7 @@ void runAsyncAllreduceTest(
     auto tensors = tests[i].getTensors();
     for (size_t j = 0; j < tensors.size(); j++) {
       auto& tensor = tensors[j];
-      auto data = tensor.data<float>();
+      auto data = tensor.data_ptr<float>();
       for (auto k = 0; k < tensor.numel(); k++) {
         if (data[k] != expected) {
           throw std::runtime_error("BOOM!");
@@ -244,7 +231,7 @@ void runAsyncBroadcastTest(
         auto tensors = tests[i].getTensors();
         for (size_t j = 0; j < tensors.size(); j++) {
           auto& tensor = tensors[j];
-          auto data = tensor.data<float>();
+          auto data = tensor.data_ptr<float>();
           for (auto k = 0; k < tensor.numel(); k++) {
             if (data[k] != expected) {
               throw std::runtime_error("BOOM!");
@@ -257,6 +244,10 @@ void runAsyncBroadcastTest(
 }
 
 int main(int argc, char** argv) {
+  if (!at::cuda::is_available()) {
+    LOG(INFO) << "CUDA not available, skipping test";
+    return EXIT_SUCCESS;
+  }
   {
     TemporaryFile file;
     runAsyncAllreduceTest(file.path, 4, 2);
@@ -266,5 +257,5 @@ int main(int argc, char** argv) {
     TemporaryFile file;
     runAsyncBroadcastTest(file.path, 4, 1);
   }
-  std::cout << "Test successful" << std::endl;
+  LOG(INFO) << "Test successful";
 }

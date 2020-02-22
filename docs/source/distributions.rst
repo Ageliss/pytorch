@@ -185,6 +185,15 @@ Probability distributions - torch.distributions
     :undoc-members:
     :show-inheritance:
 
+:hidden:`MixtureSameFamily`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: torch.distributions.mixture_same_family
+.. autoclass:: MixtureSameFamily
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 :hidden:`Multinomial`
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -257,6 +266,15 @@ Probability distributions - torch.distributions
     :undoc-members:
     :show-inheritance:
 
+:hidden:`LogitRelaxedBernoulli`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: torch.distributions.relaxed_bernoulli
+.. autoclass:: LogitRelaxedBernoulli
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 :hidden:`RelaxedOneHotCategorical`
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -292,7 +310,7 @@ Probability distributions - torch.distributions
     :members:
     :undoc-members:
     :show-inheritance:
-    
+
 :hidden:`Weibull`
 ~~~~~~~~~~~~~~~~~~~~~~~
 

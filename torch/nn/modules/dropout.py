@@ -3,6 +3,7 @@ from .. import functional as F
 
 
 class _DropoutNd(Module):
+    __constants__ = ['p', 'inplace']
 
     def __init__(self, p=0.5, inplace=False):
         super(_DropoutNd, self).__init__()
@@ -13,8 +14,7 @@ class _DropoutNd(Module):
         self.inplace = inplace
 
     def extra_repr(self):
-        inplace_str = ', inplace' if self.inplace else ''
-        return 'p={}{}'.format(self.p, inplace_str)
+        return 'p={}, inplace={}'.format(self.p, self.inplace)
 
 
 class Dropout(_DropoutNd):
@@ -37,8 +37,8 @@ class Dropout(_DropoutNd):
         inplace: If set to ``True``, will do this operation in-place. Default: ``False``
 
     Shape:
-        - Input: `Any`. Input can be of any shape
-        - Output: `Same`. Output is of the same shape as input
+        - Input: :math:`(*)`. Input can be of any shape
+        - Output: :math:`(*)`. Output is of the same shape as input
 
     Examples::
 
@@ -57,9 +57,9 @@ class Dropout(_DropoutNd):
 class Dropout2d(_DropoutNd):
     r"""Randomly zero out entire channels (a channel is a 2D feature map,
     e.g., the :math:`j`-th channel of the :math:`i`-th sample in the
-    batched input is a 2D tensor :math:`\text{input}[i, j]`) of the input tensor).
-    Each channel will be zeroed out independently on every forward call.
-    with probability :attr:`p` using samples from a Bernoulli distribution.
+    batched input is a 2D tensor :math:`\text{input}[i, j]`).
+    Each channel will be zeroed out independently on every forward call with
+    probability :attr:`p` using samples from a Bernoulli distribution.
 
     Usually the input comes from :class:`nn.Conv2d` modules.
 
@@ -99,9 +99,9 @@ class Dropout2d(_DropoutNd):
 class Dropout3d(_DropoutNd):
     r"""Randomly zero out entire channels (a channel is a 3D feature map,
     e.g., the :math:`j`-th channel of the :math:`i`-th sample in the
-    batched input is a 3D tensor :math:`\text{input}[i, j]`) of the input tensor).
-    Each channel will be zeroed out independently on every forward call.
-    with probability :attr:`p` using samples from a Bernoulli distribution.
+    batched input is a 3D tensor :math:`\text{input}[i, j]`).
+    Each channel will be zeroed out independently on every forward call with
+    probability :attr:`p` using samples from a Bernoulli distribution.
 
     Usually the input comes from :class:`nn.Conv3d` modules.
 
@@ -164,8 +164,8 @@ class AlphaDropout(_DropoutNd):
             in-place
 
     Shape:
-        - Input: `Any`. Input can be of any shape
-        - Output: `Same`. Output is of the same shape as input
+        - Input: :math:`(*)`. Input can be of any shape
+        - Output: :math:`(*)`. Output is of the same shape as input
 
     Examples::
 

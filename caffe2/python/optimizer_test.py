@@ -137,6 +137,26 @@ class TestAdagrad(OptimizerTestBase, LRModificationTestBase, TestCase):
             workspace.FetchBlob(param)
 
 
+class TestRowWiseAdagrad(OptimizerTestBase, TestCase):
+    def build_optimizer(self, model, **kwargs):
+        self._skip_gpu = True
+        return build_adagrad(
+            model, base_learning_rate=1.0, lars=0.5, rowWise=True, **kwargs
+        )
+
+    def check_optimizer(self, optimizer):
+        self.assertFalse(optimizer.get_auxiliary_parameters().shared)
+        self.assertTrue(optimizer.get_auxiliary_parameters().local)
+        for param in optimizer.get_auxiliary_parameters().local:
+            workspace.FetchBlob(param)
+
+    def testDense(self):
+        raise unittest.SkipTest("no dense support")
+
+    def testGPUDense(self):
+        raise unittest.SkipTest("no dense support")
+
+
 class TestWngrad(OptimizerTestBase, LRModificationTestBase, TestCase):
     def build_optimizer(self, model, **kwargs):
         self._skip_gpu = True
@@ -165,6 +185,25 @@ class TestAdam(OptimizerTestBase, LRModificationTestBase, TestCase):
     def build_optimizer(self, model, **kwargs):
         self._skip_gpu = False
         return build_adam(model, base_learning_rate=0.1, **kwargs)
+
+    def check_optimizer(self, optimizer):
+        self.assertTrue(optimizer.get_auxiliary_parameters().shared)
+        self.assertTrue(optimizer.get_auxiliary_parameters().local)
+        self.assertTrue(workspace.HasBlob("optimizer_iteration"))
+        iteration_tensor = workspace.FetchBlob("optimizer_iteration")
+        np.testing.assert_allclose(np.array([2000]),
+                                   iteration_tensor,
+                                   atol=1e-5)
+        for param in optimizer.get_auxiliary_parameters().shared:
+            workspace.FetchBlob(param)
+        for param in optimizer.get_auxiliary_parameters().local:
+            workspace.FetchBlob(param)
+
+
+class TestSparseRAdam(OptimizerTestBase, LRModificationTestBase, TestCase):
+    def build_optimizer(self, model, **kwargs):
+        self._skip_gpu = True
+        return build_adam(model, base_learning_rate=0.1, enableRAdam=True, **kwargs)
 
     def check_optimizer(self, optimizer):
         self.assertTrue(optimizer.get_auxiliary_parameters().shared)
@@ -438,7 +477,7 @@ class TestYellowFin(OptimizerTestBase, TestCase):
     def test_caffe2_gpu_vs_numpy(self):
         n_dim = 1000000
         n_iter = 50
-        gpu_device_opt = core.DeviceOption(caffe2_pb2.CUDA, 0)
+        gpu_device_opt = core.DeviceOption(workspace.GpuDeviceType, 0)
         with core.DeviceScope(gpu_device_opt):
             for zero_debias in [False, True]:
                 for grad_coef in [1.0, 0.1, 0.01]:

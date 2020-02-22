@@ -1,417 +1,295 @@
-#include "torch/csrc/jit/import.h"
-#include "torch/csrc/jit/ir.h"
-#include "torch/csrc/utils/functional.h"
-#include "torch/csrc/jit/assertions.h"
-#include "torch/csrc/jit/operator.h"
+#include <ATen/core/functional.h>
+#include <c10/util/Exception.h>
+#include <torch/csrc/jit/import.h>
+#include <torch/csrc/jit/import_export_helpers.h>
+#ifndef C10_MOBILE
+#include <torch/csrc/jit/import_legacy.h>
+#endif
+#include <torch/csrc/jit/import_source.h>
+#include <torch/csrc/jit/ir.h>
+#include <torch/csrc/jit/pickle.h>
+#include <torch/csrc/jit/unpickler.h>
+#include <torch/csrc/jit/script/script_type_parser.h>
+#include <torch/csrc/jit/source_range_serialization.h>
 
+#include "caffe2/serialize/file_adapter.h"
 #include "caffe2/serialize/inline_container.h"
-#include "onnx/onnx_pb.h"
+#include "caffe2/serialize/istream_adapter.h"
 
 #include <ATen/ATen.h>
 
+#include <fstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
-#include <string>
-#include <fstream>
 
-namespace torch { namespace jit {
+namespace torch {
+namespace jit {
+
+using caffe2::serialize::FileAdapter;
+using caffe2::serialize::IStreamAdapter;
+using caffe2::serialize::PyTorchStreamReader;
+using caffe2::serialize::ReadAdapterInterface;
+
+void postSetStateValidate(const IValue& v) {
+  auto obj = v.toObject();
+  const auto& objType = obj->type();
+  for (size_t i = 0; i < objType->numAttributes(); i++) {
+    const auto& attrType = objType->getAttribute(i);
+    const auto& attrName = objType->getAttributeName(i);
+    const auto& slot = obj->getSlot(i);
+    // const auto attrType = objType->getAttribute(i);
+    // Verify that all the non-optional attributes have been initialized
+    // TODO: Issue #20497
+    if (attrType->kind() != TypeKind::OptionalType) {
+      TORCH_CHECK(
+          !slot.isNone(),
+          "The field '",
+          attrName,
+          "' was left unitialized after __setstate__, but expected a ",
+          "value of type '",
+          attrType->python_str(),
+          "'");
+    }
+  }
+}
+
+IValue readArchiveAndTensors(
+    const std::string& archive_name,
+    c10::optional<TypeResolver> type_resolver,
+    c10::optional<ObjLoader> obj_loader,
+    c10::optional<at::Device> device,
+    PyTorchStreamReader& stream_reader) {
+  std::string picklename = archive_name + ".pkl";
+  at::DataPtr pickle_ptr;
+  size_t pickle_size;
+  std::tie(pickle_ptr, pickle_size) = stream_reader.getRecord(picklename);
+
+  size_t bytes_read = 0;
+  auto data = reinterpret_cast<const char*>(pickle_ptr.get());
+  auto reader = [&](char* buffer, size_t len) -> size_t {
+    if (bytes_read >= pickle_size) {
+      return 0;
+    }
+    len = std::min(pickle_size - bytes_read, len);
+    // Copy len bytes into buffer
+    const char* start = data + bytes_read;
+    std::memcpy(buffer, start, len);
+    bytes_read += len;
+    return len;
+  };
+
+  std::string archive_name_plus_slash = archive_name + "/";
+  auto read_record = [&](const std::string& name) {
+    std::string ss = archive_name_plus_slash + name;
+    return std::get<0>(stream_reader.getRecord(ss));
+  };
+
+  Unpickler unpickler(
+      reader,
+      type_resolver ? std::move(*type_resolver) : nullptr,
+      obj_loader ? std::move(*obj_loader) : nullptr,
+      std::move(read_record),
+      device);
+  return unpickler.parse_ivalue();
+}
 
 namespace {
 
-namespace onnx = ::ONNX_NAMESPACE;
 
-// IR graph construction
-
-class ModuleDecoder {
+// This is a deserializer class which loads script modules from pt files.
+// Content of the file is written using PyTorchStreamWriter, for details please
+// check caffe2/serialize/inline_container.h.
+// The module is saved in pickle. readArchive() is called to parse and construct
+// the constant table and the script module.
+class ScriptModuleDeserializer final {
  public:
-  ModuleDecoder(ModuleLookup module_lookup,
-                std::istream& in);
+  ScriptModuleDeserializer(
+      std::shared_ptr<script::CompilationUnit> cu,
+      std::unique_ptr<PyTorchStreamReader> reader)
+      : compilation_unit_(cu),
+        reader_(std::move(reader)),
+        source_importer_(
+            compilation_unit_,
+            &constants_table_,
+            [this](const std::string& qualifier) {
+              return findSourceInArchiveFromQualifier(
+                  *reader_, export_prefix_, qualifier);
+            },
+            reader_->version()) {}
+
+  script::Module deserialize(
+      c10::optional<at::Device> device,
+      script::ExtraFilesMap& extra_files);
 
  private:
-  std::shared_ptr<Graph> buildGraph(const onnx::GraphProto& graph_proto);
+  IValue readArchive(const std::string& archive_name);
 
-  void buildBlock(const onnx::GraphProto& graph_proto, Block* block,
-                  std::unordered_map<std::string, Value*>& value_map);
-
-  void buildBlocks(const std::vector<onnx::GraphProto>& graphs_, Node* node,
-                   std::unordered_map<std::string, Value*>& value_map);
-
-  void buildValue(Value* value, const onnx::ValueInfoProto& valueinfo_proto);
-
-  void buildIntermediateValue(Value* value, const std::string& name);
-
-  at::ScalarType onnxTypeToATenType(onnx::TensorProto_DataType tensor_proto);
-
-  at::Tensor buildTensor(const onnx::TensorProto& tensor_proto);
-
-  TypePtr buildType(const onnx::TypeProto& type_proto);
-
-  at::Tensor buildParameter(const onnx::TensorProto& tensor_proto);
-
-  at::Tensor buildTensorCommon(const onnx::TensorProto& tensor_proto,
-                               const uint64_t record_number,
-                               const int64_t storage_offset,
-                               const std::vector<int64_t>& strides);
-
-  std::pair<std::shared_ptr<script::Module>, std::string> parseFullName(
-      ModuleLookup module_lookup,
-      const std::string fullname);
-
-  PyTorchStreamReader stream_reader_;
-  std::unordered_map<uint64_t, std::shared_ptr<at::Storage>> storage_map_;
-  std::unordered_map<std::string, const onnx::TypeProto*> value_type_map_;
+  std::shared_ptr<script::CompilationUnit> compilation_unit_;
+  std::unique_ptr<PyTorchStreamReader> reader_;
+  c10::optional<at::Device> device_;
+  std::vector<at::Tensor> constants_table_;
+  script::SourceImporter source_importer_;
+  std::string export_prefix_ = "code/";
 };
 
-at::ScalarType ModuleDecoder::onnxTypeToATenType(onnx::TensorProto_DataType onnx_type) {
-  switch(onnx_type) {
-    case onnx::TensorProto_DataType_UINT8:
-      return at::kByte;
-    case onnx::TensorProto_DataType_INT8:
-      return at::kChar;
-    case onnx::TensorProto_DataType_INT16:
-      return at::kShort;
-    case onnx::TensorProto_DataType_INT32:
-      return at::kInt;
-    case onnx::TensorProto_DataType_INT64:
-      return at::kLong;
-    case onnx::TensorProto_DataType_FLOAT16:
-      return at::kHalf;
-    case onnx::TensorProto_DataType_FLOAT:
-      return at::kFloat;
-    case onnx::TensorProto_DataType_DOUBLE:
-      return at::kDouble;
-    default:
-      throw std::runtime_error("Unsupported data type");
-  }
-}
-
-void ModuleDecoder::buildBlocks(
-    const std::vector<onnx::GraphProto>& graphs_, Node* node,
-    std::unordered_map<std::string, Value*>& value_map) {
-  for (auto g_ : graphs_) {
-    auto block = node->addBlock();
-    buildBlock(g_, block, value_map);
-  }
-}
-
-std::shared_ptr<Graph> ModuleDecoder::buildGraph(const onnx::GraphProto& graph_proto) {
-  auto graph = std::make_shared<Graph>();
-  std::unordered_map<std::string, Value*> value_map;
-
-  buildBlock(graph_proto, graph->block(), value_map);
-
-  return graph;
-}
-
-void ModuleDecoder::buildBlock(const onnx::GraphProto& graph_proto, Block* block,
-                std::unordered_map<std::string, Value*>& value_map) {
-  for (auto &subtype : graph_proto.value_info()) {
-    value_type_map_[subtype.name()] = &subtype.type();
-  }
-
-  for (auto & input : graph_proto.input()) {
-    auto value = block->addInput();
-    value_map[input.name()] = value;
-    buildValue(value, input);
-  }
-
-  for (auto & node_ : graph_proto.node()) {
-    JIT_ASSERT(node_.op_type() != "PythonOp");
-
-    auto node = block->owningGraph()->create(Symbol::fromDomainAndUnqualString(node_.domain(), node_.op_type()),
-                                             node_.output().size());
-
-    for (auto & attr : node_.attribute()) {
-      Symbol name = Symbol::attr(attr.name());
-
-      switch(attr.type()) {
-        case onnx::AttributeProto_AttributeType_UNDEFINED:
-          throw std::runtime_error("UNDEFINED attribute unsupported");
-          break;
-        case onnx::AttributeProto_AttributeType_FLOAT:
-          node->f_(name, attr.f());
-          break;
-        case onnx::AttributeProto_AttributeType_INT:
-          node->i_(name, attr.i());
-          break;
-        case onnx::AttributeProto_AttributeType_STRING:
-          node->s_(name, std::move(attr.s()));
-          break;
-        case onnx::AttributeProto_AttributeType_TENSOR:
-          node->t_(name, buildTensor(attr.t()));
-          break;
-        case onnx::AttributeProto_AttributeType_GRAPH:
-          node->g_(name, buildGraph(attr.g()));
-          break;
-        case onnx::AttributeProto_AttributeType_FLOATS:
-          node->fs_(name, {attr.floats().begin(), attr.floats().end()});
-          break;
-        case onnx::AttributeProto_AttributeType_INTS:
-          node->is_(name, {attr.ints().begin(), attr.ints().end()});
-          break;
-        case onnx::AttributeProto_AttributeType_STRINGS:
-          node->ss_(name, {attr.strings().begin(), attr.strings().end()});
-          break;
-        case onnx::AttributeProto_AttributeType_TENSORS:
-          node->ts_(name, fmap(attr.tensors(), [this](const onnx::TensorProto& t) {
-                                                 return buildTensor(t);
-                                               }));
-          break;
-        case onnx::AttributeProto_AttributeType_GRAPHS:
-          if (attr.name() == "_blocks") {
-            buildBlocks({attr.graphs().begin(), attr.graphs().end()}, node, value_map);
-          }
-          else {
-            node->gs_(name, fmap(attr.graphs(), [this](const onnx::GraphProto& g_) {
-                                                  return buildGraph(g_);
-                                                }));
-          }
-          break;
-      }
-    }
-
-    for (auto & input : node_.input()) {
-      auto v = value_map[input];
-      node->addInput(v);
-    }
-
-    for (int i=0; i<node_.output().size(); i++) {
-      value_map[node_.output(i)] = node->outputs()[i];
-      buildIntermediateValue(node->outputs()[i], node_.output(i));
-    }
-
-    block->appendNode(node);
-  }
-
-  for (auto & output : graph_proto.output()) {
-    Value* v = value_map.at(output.name());
-    buildValue(v, output);
-    block->registerOutput(v);
-  }
-}
-
-TypePtr ModuleDecoder::buildType(const onnx::TypeProto& type_proto) {
-  auto tensortype_proto = type_proto.tensor_type();
-  auto shape_proto = tensortype_proto.shape();
-  auto kind = type_proto.denotation();
-  if (kind == "DynamicType") {
-    return DynamicType::get();
-  } else if (kind == "TensorType") {
-    auto dims = shape_proto.dim_size();
-    return TensorType::create(onnxTypeToATenType(tensortype_proto.elem_type()), -1, dims);
-  } else if (kind == "CompleteTensorType") {
-    // first half of the dims are sizes and the second half are strides
-    auto total = shape_proto.dim_size();
-    std::vector<int64_t> sizes, strides;
-    for (int i = 0; i < total / 2; i++) {
-      sizes.push_back(shape_proto.dim(i).dim_value());
-    }
-    for (int i = total / 2; i < total; i++) {
-      strides.push_back(shape_proto.dim(i).dim_value());
-    }
-    return CompleteTensorType::create(onnxTypeToATenType(tensortype_proto.elem_type()), -1, sizes, strides);
-  } else if (kind == "TupleType") {
-    std::vector<TypePtr> elems;
-    for (auto &subkind : shape_proto.dim()) {
-      auto it = value_type_map_.find(subkind.dim_param());
-      JIT_ASSERT(it != value_type_map_.end());
-      elems.push_back(buildType(*it->second));
-    }
-    return TupleType::create(elems);
-  } else if (kind == "ListType") {
-    auto subkind = shape_proto.dim(0);
-    auto it = value_type_map_.find(subkind.dim_param());
-    JIT_ASSERT(it != value_type_map_.end());
-    return ListType::create(buildType(*it->second));
-  } else if (kind == "NumberType") {
-    return NumberType::get();
-  } else if (kind == "FloatType") {
-    return FloatType::get();
-  } else if (kind == "IntType") {
-    return IntType::get();
-  } else if (kind == "BoolType") {
-    return BoolType::get();
-  } else if (kind == "NoneType") {
-    return NoneType::get();
-  } else if (kind == "GeneratorType") {
-    return GeneratorType::get();
-  } else if (kind == "WorldType") {
-    return WorldType::get();
-  } else if (kind == "StringType") {
-    return StringType::get();
-  } else if (kind.find("TypeVar:") == 0) {
-    return VarType::create(kind.substr(strlen("TypeVar:")));
-  } else {
-    throw std::runtime_error("unexpected string for type kind: " + kind);
-  }
-}
-
-void ModuleDecoder::buildValue(Value* value, const onnx::ValueInfoProto& valueinfo_proto) {
-  value->setType(buildType(valueinfo_proto.type()));
-}
-
-void ModuleDecoder::buildIntermediateValue(Value* value, const std::string& name) {
-  auto it = value_type_map_.find(name);
-  JIT_ASSERT(it != value_type_map_.end());
-  value->setType(buildType(*it->second));
-}
-
-at::Tensor ModuleDecoder::buildParameter(const onnx::TensorProto& tensor_proto) {
-  std::vector<int64_t> strides;
-  // We've stored four other values (is_buffer, requires_grad, record no., storage_offset) before strides; ignore them
-  std::move(tensor_proto.int64_data().begin() + 4, tensor_proto.int64_data().end(), std::back_inserter(strides));
-  auto tensor = buildTensorCommon(tensor_proto,
-                                  /* record_number = */ tensor_proto.int64_data(2),
-                                  /* storage_offset = */ tensor_proto.int64_data(3),
-                                  strides);
-  autograd::Variable var = autograd::make_variable(tensor, /* requires_grad = */ tensor_proto.int64_data(1));
-  return var;
-}
-
-at::Tensor ModuleDecoder::buildTensor(const onnx::TensorProto& tensor_proto) {
-  std::vector<int64_t> strides;
-  // We've stored two other values (record no., storage_offset) before strides; ignore it
-  std::move(tensor_proto.int64_data().begin() + 2, tensor_proto.int64_data().end(), std::back_inserter(strides));
-  return buildTensorCommon(tensor_proto,
-                           /* record_number = */ tensor_proto.int64_data(0),
-                           /* storage_offset = */ tensor_proto.int64_data(1),
-                           strides);
-}
-
-at::Tensor ModuleDecoder::buildTensorCommon(
-    const onnx::TensorProto& tensor_proto,
-    const uint64_t record_number,
-    const int64_t storage_offset,
-    const std::vector<int64_t>& strides) {
-  // NB: storage_offset and strides are passed in separately because
-  // because they are encoded differently for parameters and tensors
-  auto type = onnxTypeToATenType(tensor_proto.data_type());
-  std::vector<int64_t> dims;
-  std::move(tensor_proto.dims().begin(), tensor_proto.dims().end(), std::back_inserter(dims));
-
-  // Find or create the storage
-  auto storage_it = storage_map_.find(record_number);
-  if (storage_it == storage_map_.end()) {
-    at::DataPtr storage_ptr;
-    int64_t size;
-    std::tie(storage_ptr, size) = stream_reader_.getRecordWithKey(record_number);
-    auto storage = std::make_shared<at::Storage>(
-      at::CPU(type).typeMeta(),
-      std::move(storage_ptr),
-      size / at::CPU(type).typeMeta().itemsize(),
-      nullptr);
-    storage_map_.insert(std::make_pair(record_number, storage));
-    return at::CPU(type).tensor(*storage, storage_offset, dims, strides);
-  }
-
-  auto storage = storage_it->second.get();
-  return at::CPU(type).tensor(*storage, storage_offset, dims, strides);
-}
-
-// Given a full name of a parameter or method,
-// return the parent submodule and local name
-std::pair<std::shared_ptr<script::Module>, std::string> ModuleDecoder::parseFullName(
-    ModuleLookup module_lookup,
-    const std::string fullname) {
-  AT_ASSERT(!fullname.empty());
-  std::vector<std::string> vec;
-  std::stringstream ss(fullname);
-  std::string name;
-  while (std::getline(ss, name, '.')) {
-    vec.push_back(name);
-  }
-
-  std::string last = vec.back();
-  vec.pop_back();
-  return std::make_pair(module_lookup(vec), std::move(last));
-}
-
-ModuleDecoder::ModuleDecoder(
-    ModuleLookup module_lookup,
-    std::istream& in) :
-    stream_reader_(&in) {
-  auto model_proto = onnx::ModelProto();
-  auto record = stream_reader_.getLastRecord();
-  model_proto.ParsePartialFromArray(std::get<0>(record).get(), std::get<1>(record));
-  auto graph_proto = model_proto.graph();
-
-  std::unordered_map<std::string, at::Tensor*> param_map;
-
-  for (auto &tensor_proto : graph_proto.initializer()) {
-    std::shared_ptr<script::Module> parent_module;
-    std::string name;
-    std::tie(parent_module, name) = parseFullName(module_lookup, tensor_proto.name());
-
-    auto param = buildParameter(tensor_proto);
-    parent_module->register_parameter(name, param, /* is_buffer = */ tensor_proto.int64_data(0));
-    param_map[tensor_proto.name()] = parent_module->parameter_slot(name);
-  }
-
-  for (auto &node_proto : graph_proto.node()) {
-    std::shared_ptr<script::Module> parent_module;
-    std::string name;
-    std::tie(parent_module, name) = parseFullName(module_lookup, node_proto.name());
-
-    std::vector<at::Tensor*> member_inputs;
-    for (auto &param_name : node_proto.input()) {
-      member_inputs.push_back(param_map[param_name]);
-    }
-
-    auto graph = buildGraph(node_proto.attribute(0).g());
-    // has_domain field has a string iff the method was optimized
-    parent_module->set_optimized(node_proto.has_domain());
-    parent_module->create_method(name, graph, member_inputs);
-    // We store the schema in the docstring so we can parse the schema and
-    // assign it to the method.
-    auto schema = parseSchema(node_proto.doc_string());
-    parent_module->get_method(name).setSchema(std::move(schema));
-  }
-}
-
-}  // namespace
-
-void import_ir_module(
-    ModuleLookup module_lookup,
-    std::istream& in) {
-  ModuleDecoder decoder(module_lookup, in);
-  (void)decoder;
-}
-
-void import_ir_module(
-    ModuleLookup module_lookup,
-    const std::string& filename) {
-  std::ifstream in(filename, std::ios_base::binary);
-
-  ModuleDecoder decoder(module_lookup, in);
-  (void)decoder;
-}
-
-std::shared_ptr<script::Module> load(std::istream& in) {
-  auto module = std::make_shared<script::Module>();
-
-  auto module_lookup = [&](const std::vector<std::string>& qualified_name) {
-    std::shared_ptr<script::Module> curr = module;
-    for (const auto& name : qualified_name) {
-      if (curr->find_module(name) == nullptr) {
-        curr->register_module(name, std::make_shared<script::Module>());
-      }
-      curr = curr->get_module(name);
-    }
-    return curr;
+IValue ScriptModuleDeserializer::readArchive(const std::string& archive_name) {
+  auto type_resolver = [&](const c10::QualifiedName& qn) {
+    auto cls = source_importer_.loadNamedType(qn)->expect<ClassType>();
+    return c10::StrongTypePtr(compilation_unit_, std::move(cls));
   };
 
-  ModuleDecoder decoder(module_lookup, in);
-  (void)decoder;
+  // Decouple how to get obj from type. In this file it's dependent on
+  // Method.run() and graph executor, etc.
+  // For bytecode import we need to decouple these dependencies.
+  auto obj_loader = [&](at::StrongTypePtr type, IValue input) {
+    auto cls = type.type_->expect<at::ClassType>();
+    size_t n = cls->numAttributes();
+    if (checkHasValidSetGetState(cls)) {
+      auto obj = c10::ivalue::Object::create(type, n);
+      // XXX: Do not optimize __setstate__, so that we don't try to
+      // specialize the class before it is initialized.
+      setGraphExecutorOptimize(false);
+      Function* set_state = cls->getMethod("__setstate__");
+      // since we are in the middle of unpickling we might still have lists and
+      // dicts that do not have accurate tags (e.g. they report they are
+      // List[Any]). But we need to run __setstate__ which will check the input
+      // type and may access the tags. Since setstate has a known input type, we
+      // can correctly restore the tags now by apply the input type of set_state
+      // to the state object being passed.
+      restoreAccurateTypeTags(
+          input, set_state->getSchema().arguments().at(1).type());
+      (*set_state)({obj, input});
+      setGraphExecutorOptimize(true);
+      postSetStateValidate(obj);
+      return obj;
+    } else {
+      auto dict = std::move(input).toGenericDict();
+      auto obj = c10::ivalue::Object::create(type, n);
+      for (size_t i = 0; i < n; ++i) {
+        obj->setSlot(i, dict.at(cls->getAttributeName(i)));
+      }
+      return obj;
+    }
+  };
 
+  return readArchiveAndTensors(
+      archive_name, type_resolver, obj_loader, device_, *reader_.get());
+}
+
+script::Module ScriptModuleDeserializer::deserialize(
+    c10::optional<at::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  C10_LOG_API_USAGE_ONCE("torch.script.load");
+  device_ = device;
+  // Load extra files.
+  for (const auto& kv : extra_files) {
+    const std::string& key = "extra/" + kv.first;
+    if (reader_->hasRecord(key)) {
+      at::DataPtr meta_ptr;
+      size_t meta_size;
+      std::tie(meta_ptr, meta_size) = reader_->getRecord(key);
+      extra_files[kv.first] =
+          std::string(static_cast<char*>(meta_ptr.get()), meta_size);
+    }
+  }
+  if (reader_->hasRecord("model.json")) {
+#ifndef C10_MOBILE
+    return torch::jit::LEGACY_deserialize(
+        compilation_unit_, std::move(reader_), device_);
+#else
+    AT_ERROR("Legacy model format is not supported on mobile.");
+#endif
+  }
+  auto tuple = readArchive("constants").toTuple();
+  for (auto constant : tuple->elements()) {
+    constants_table_.push_back(constant.toTensor());
+  }
+  return script::Module(readArchive("data").toObject());
+}
+
+} // namespace
+
+script::Module import_ir_module(
+    std::shared_ptr<script::CompilationUnit> cu,
+    std::istream& in,
+    c10::optional<at::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  auto reader = torch::make_unique<PyTorchStreamReader>(&in);
+  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+  return deserializer.deserialize(device, extra_files);
+}
+
+script::Module import_ir_module(
+    std::shared_ptr<script::CompilationUnit> cu,
+    const std::string& filename,
+    c10::optional<at::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  auto reader = torch::make_unique<PyTorchStreamReader>(filename);
+  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+  return deserializer.deserialize(device, extra_files);
+}
+
+script::Module import_ir_module(
+    std::shared_ptr<script::CompilationUnit> cu,
+    std::unique_ptr<ReadAdapterInterface> rai,
+    c10::optional<at::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  auto reader = torch::make_unique<PyTorchStreamReader>(std::move(rai));
+  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+  return deserializer.deserialize(device, extra_files);
+}
+
+script::Module load(
+    std::istream& in,
+    c10::optional<at::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  std::unique_ptr<IStreamAdapter> rai =
+      std::make_unique<IStreamAdapter>(&in);
+  auto module = load(std::move(rai), device, extra_files);
   return module;
 }
 
-std::shared_ptr<script::Module> load(const std::string& filename) {
-  std::ifstream in(filename, std::ios_base::binary);
-
-  auto module = load(in);
-
+script::Module load(
+    const std::string& filename,
+    c10::optional<at::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  std::unique_ptr<FileAdapter> rai = std::make_unique<FileAdapter>(filename);
+  auto module = load(std::move(rai), device, extra_files);
   return module;
 }
 
-}}
+script::Module load(
+    std::unique_ptr<ReadAdapterInterface> rai,
+    c10::optional<c10::Device> device,
+    script::ExtraFilesMap& extra_files) {
+  // Verify that we're loading a zip archive and not a torch.save pickle archive
+  // (marked by the 0x80 0x02 bytes at the start)
+  uint8_t first_short[2];
+  rai->read(
+      /*pos=*/0,
+      /*buf=*/&first_short,
+      /*n=*/2,
+      /*what=*/"checking archive");
+  if (first_short[0] == 0x80 && first_short[1] == 0x02) {
+    // NB: zip files by spec can start with any data, so technically they might
+    // start with 0x80 0x02, but in practice zip files start with a file entry
+    // which begins with 0x04034b50. Furthermore, PyTorch will never produce zip
+    // files that do not start with the file entry, so it is relatively safe to
+    // perform this check.
+    TORCH_CHECK(
+        false,
+        "`torch::jit::load()` received a file from `torch.save()`, "
+        "but `torch::jit::load()` can only load files"
+        " produced by `torch.jit.save()`");
+  }
+
+  auto reader = torch::make_unique<PyTorchStreamReader>(std::move(rai));
+  auto cu = std::make_shared<script::CompilationUnit>();
+
+  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+  return deserializer.deserialize(device, extra_files);
+}
+
+} // namespace jit
+} // namespace torch

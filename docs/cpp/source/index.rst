@@ -41,7 +41,7 @@ look as follows:
   at::Tensor b = at::randn({2, 2});
   auto c = a + b.to(at::kInt);
 
-This ``Tensor`` class and all other symbols in ATen are found in the `at::`
+This ``Tensor`` class and all other symbols in ATen are found in the ``at::``
 namespace, documented
 `here <https://pytorch.org/cppdocs/api/namespace_at.html#namespace-at>`_.
 
@@ -53,7 +53,7 @@ ATen ``Tensor`` class with capabilities concerning automatic differentiation.
 The autograd system records operations on tensors to form an *autograd graph*.
 Calling ``backwards()`` on a leaf variable in this graph performs reverse mode
 differentiation through the network of functions and tensors spanning the
-autograd graph, ultimately yieldings gradients. The following example provides
+autograd graph, ultimately yielding gradients. The following example provides
 a taste of this interface:
 
 .. code-block:: cpp
@@ -61,14 +61,14 @@ a taste of this interface:
   #include <torch/csrc/autograd/variable.h>
   #include <torch/csrc/autograd/function.h>
 
-  at::Tensor a = torch::ones({2, 2}, at::requires_grad());
-  at::Tensor b = torch::randn({2, 2});
+  torch::Tensor a = torch::ones({2, 2}, torch::requires_grad());
+  torch::Tensor b = torch::randn({2, 2});
   auto c = a + b;
   c.backward(); // a.grad() will now hold the gradient of c w.r.t. a.
 
 The ``at::Tensor`` class in ATen is not differentiable by default. To add the
 differentiability of tensors the autograd API provides, you must use tensor
-factory functions from the `torch::` namespace instead of the `at` namespace.
+factory functions from the `torch::` namespace instead of the `at::` namespace.
 For example, while a tensor created with `at::ones` will not be differentiable,
 a tensor created with `torch::ones` will be.
 
@@ -90,7 +90,7 @@ frontend includes the following:
 - Entry points to the TorchScript JIT compiler;
 - Helpful utilities to facilitate interfacing with the ATen and Autograd APIs.
 
-See `this <https://pytorch.org/cppdocs/frontend.html>`_ document for a more
+See `this document <https://pytorch.org/cppdocs/frontend.html>`_ for a more
 detailed description of the C++ frontend. Relevant sections of the `torch::`
 namespace related to the C++ Frontend include `torch::nn
 <https://pytorch.org/cppdocs/api/namespace_torch__nn.html#namespace-torch-nn>`_,
@@ -151,7 +151,7 @@ does not add any new functionality to the PyTorch C++ API. Instead, it
 provides integration with Python setuptools as well as JIT compilation
 mechanisms that allow access to ATen, the autograd and other C++ APIs from
 Python. To learn more about the C++ extension API, see
-`this <https://pytorch.org/tutorials/advanced/cpp_extension.html>`_ tutorial.
+`this tutorial <https://pytorch.org/tutorials/advanced/cpp_extension.html>`_.
 
 Contents
 --------
@@ -159,12 +159,16 @@ Contents
 .. toctree::
    :maxdepth: 2
 
-   frontend
    installing
-   faq
-   contributing
+   frontend
    api/library_root
 
+.. toctree::
+  :glob:
+  :maxdepth: 1
+  :caption: Notes
+
+  notes/*
 
 Indices and tables
 ==================

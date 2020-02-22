@@ -12,8 +12,9 @@ namespace int8 {
 
 class Int8FlattenOp : public Operator<CPUContext> {
  public:
-  Int8FlattenOp(const OperatorDef& operator_def, Workspace* ws)
-      : Operator<CPUContext>(operator_def, ws),
+  template <class... Args>
+  explicit Int8FlattenOp(Args&&... args)
+      : Operator<CPUContext>(std::forward<Args>(args)...),
         axis_(this->template GetSingleArgument<int>("axis", 1)) {}
 
   bool RunOnDevice() override {
@@ -29,10 +30,10 @@ class Int8FlattenOp : public Operator<CPUContext> {
         X.t.sizes().size(), axis_, "The rank of the tensor must be >= axis.");
     Y->t.Resize(X.t.size_to_dim(axis_), X.t.size_from_dim(axis_));
     context_.CopyItemsToCPU(
-        X.t.meta(),
+        X.t.dtype(),
         X.t.numel(),
         X.t.raw_data(),
-        Y->t.raw_mutable_data(X.t.meta()));
+        Y->t.raw_mutable_data(X.t.dtype()));
     return true;
   }
 
